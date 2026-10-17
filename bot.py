@@ -1,0 +1,1123 @@
+import os
+import re
+import json
+import time
+import discord
+from discord import app_commands
+import sqlite3
+from datetime import timedelta
+from discord.ext import tasks
+
+TOKEN = os.getenv("DISCORD_TOKEN")  # Token'ı koda yazma, ortam değişkeni olarak ver
+HOSGELDIN_KANAL_ADI = "genel"       # Hoş geldin mesajının atılacağı kanal
+BAN_DOSYASI = "banlar.json"         # Ortak ban listesi (silme!)
+MESAJ_DB = "mesajlar.db"            # Mesaj kayıtları (silinmiş mesaj listesi için)
+MESAJ_SAKLAMA_GUN = 30              # Kayıtlar bu kadar gün sonra otomatik silinir
+AYAR_DOSYASI = "ayarlar.json"       # /botcezakanal ve /cezakanal kanal ayarları
+MUTE_DOSYASI = "mutelar.json"       # Aktif mute kayıtları (silme!)
+OWNER_KULLANICI_ID = 1221139908471558144  # Sadece bu kullanıcı botu DM'den kontrol edebilir
+
+# ---------- Otomod ayarları ----------
+KUFUR_MUTE_SURESI = 7 * 86400   # Küfür: 7 gün mute
+LINK_MUTE_SURESI = 30 * 86400   # Link: 30 gün mute
+SPAM_MUTE_SURESI = 30 * 86400   # Spam: 30 gün mute
+SPAM_SINIRI = 10                # Üst üste kaç aynı mesaj spam sayılsın
+MAKS_TIMEOUT = 27 * 86400       # Discord zaman aşımı en fazla 28 gün; daha uzun mute'lar parça parça uzatılır
+
+# OTOMOD-BASLANGIC
+LINK_REGEX = re.compile(
+    r"(https?://|www\.|discord\.gg/|discord(app)?\.com/invite/)"
+    r"|\b[a-z0-9-]+\.(com|net|org|info|biz|xyz|gg|io|tk|app|link|site|online|shop|top|club|ru|ly)\b",
+    re.IGNORECASE,
+)
+
+# Küfür listesi: yazım hileleri (ş/s, ı/i, a4, tekrar eden harf) normalize edilir.
+# Kelimeleri buradan ekleyip çıkarabilirsin. Yazılışlar normalize (ASCII, tekrarsız harf) olmalı.
+KUFUR_TAM = {"amk", "aq", "amq"}  # Tam eşleşme (kısaltmalar)
+KUFUR_KOKLERI = (                 # Bu köklerle başlayan kelimeler
+    "siktir", "sikeyim", "sikerim", "orospu", "yarak", "amcik", "gotun",
+    "gotveren", "pezevenk", "ibne", "gavat", "kahpe",
+)
+KUFUR_IFADELER = ("amina koy", "amina kod", "anani sik", "ananin ami")
+
+_HARITA = str.maketrans({
+    "ı": "i", "ş": "s", "ç": "c", "ğ": "g", "ö": "o", "ü": "u",
+    "0": "o", "1": "i", "3": "e", "4": "a", "5": "s", "7": "t", "@": "a", "$": "s",
+})
+
+
+def kufur_var_mi(metin: str) -> bool:
+    n = metin.replace("İ", "i").lower().translate(_HARITA)
+    belirteler = [re.sub(r"(.)\1+", r"\1", t) for t in re.findall(r"[a-z]+", n)]
+    for t in belirteler:
+        if t in KUFUR_TAM or t.startswith(KUFUR_KOKLERI):
+            return True
+    birlesik = " ".join(belirteler)
+    return any(i in birlesik for i in KUFUR_IFADELER)
+# OTOMOD-BITIS
+
+# (sunucu_id, kullanici_id) -> {"icerik": son mesaj, "sayi": üst üste kaç kez}
+spam_durum = {}
+
+# Mesaj kayıt veritabanı
+db = sqlite3.connect(MESAJ_DB)
+db.execute(
+    """CREATE TABLE IF NOT EXISTS mesajlar (
+        id INTEGER PRIMARY KEY, sunucu_id INTEGER, kanal_id INTEGER,
+        yazar_id INTEGER, yazar_ad TEXT, icerik TEXT, ekler TEXT,
+        yazilma INTEGER, silinme INTEGER)"""
+)
+db.commit()
+
+# /clear ile silinen mesajların ID'leri (bunlar "silinmiş mesaj" listesine girmesin)
+clear_idleri = set()
+
+intents = discord.Intents.default()
+intents.members = True          # Developer Portal > Bot > "Server Members Intent" açık olmalı
+intents.message_content = True  # Developer Portal > Bot > "Message Content Intent" açık olmalı (!format için)
+
+FORMAT_METNI = """İstenilen rütbe:
+İstenilen branş:
+İstenilen branş rütbe:
+İstenilen birim:
+İstenilen birim rütbe:
+İstenilen tim:
+İstenilen tim rütbe:
+Ekstra istek:
+Tecrübeli olunan kamplar ve bu kamplarda rütbeleriniz:
+Tecrübe kanıt SS'leri:"""
+
+# Bot sunucuya eklenirken davet linki bu izinleri ister
+GEREKLI_IZINLER = discord.Permissions(
+    view_channel=True,          # Mesajları görüp kaydedebilmesi için
+    send_messages=True,
+    embed_links=True,
+    read_message_history=True,
+    manage_messages=True,       # /clear için
+    create_instant_invite=True, # /davet için
+    ban_members=True,           # /ban, /databan, /unban ve otomod banı için
+    moderate_members=True,      # /mute ve otomod susturması için
+    mention_everyone=True,      # Otomod uyarılarında @here etiketi için
+)
+
+
+# ---------- Ortak ban listesi (JSON) ----------
+# Yapı: { "kullanici_id": {"bitis": unix_zaman | None, "sunucu_id": int, "sebep": str} }
+# bitis = None  -> süresiz ban (/databan)
+def banlari_yukle() -> dict:
+    try:
+        with open(BAN_DOSYASI, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def banlari_kaydet(veri: dict):
+    with open(BAN_DOSYASI, "w", encoding="utf-8") as f:
+        json.dump(veri, f, ensure_ascii=False, indent=2)
+
+
+def ban_aktif_mi(kayit: dict) -> bool:
+    return kayit["bitis"] is None or kayit["bitis"] > time.time()
+
+
+SURE_BIRIMLERI = {"dk": 60, "m": 60, "sa": 3600, "h": 3600, "g": 86400, "d": 86400, "hf": 604800, "w": 604800}
+
+
+def sure_coz(metin: str):
+    """'30dk', '2sa', '7g', '1hf' gibi süreyi saniyeye çevirir. Geçersizse None."""
+    m = re.fullmatch(r"(\d+)\s*(dk|m|sa|h|g|d|hf|w)", metin.strip().lower())
+    if not m:
+        return None
+    saniye = int(m.group(1)) * SURE_BIRIMLERI[m.group(2)]
+    return saniye if saniye > 0 else None
+
+
+# ---------- Genel JSON yardımcıları (ayarlar, mute kayıtları) ----------
+def json_yukle(dosya: str) -> dict:
+    try:
+        with open(dosya, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def json_kaydet(dosya: str, veri: dict):
+    with open(dosya, "w", encoding="utf-8") as f:
+        json.dump(veri, f, ensure_ascii=False, indent=2)
+
+
+# ---------- Mute (Discord zaman aşımı) ----------
+# Kayıt: "sunucu_id:kullanici_id" -> {"bitis": mute'un bitiş zamanı, "kesim": mevcut zaman aşımı parçasının bitişi}
+async def mute_uygula(uye: discord.Member, saniye: int, sebep: str) -> int:
+    """Üyeyi susturur, bitiş zamanını (unix) döner. 28 günden uzun süreler parça parça uzatılır."""
+    simdi = int(time.time())
+    parca = min(saniye, MAKS_TIMEOUT)
+    await uye.timeout(timedelta(seconds=parca), reason=sebep[:500])
+    kayitlar = json_yukle(MUTE_DOSYASI)
+    kayitlar[f"{uye.guild.id}:{uye.id}"] = {"bitis": simdi + saniye, "kesim": simdi + parca}
+    json_kaydet(MUTE_DOSYASI, kayitlar)
+    return simdi + saniye
+
+
+async def mute_kaldir(uye: discord.Member, sebep: str):
+    kayitlar = json_yukle(MUTE_DOSYASI)
+    kayitlar.pop(f"{uye.guild.id}:{uye.id}", None)
+    json_kaydet(MUTE_DOSYASI, kayitlar)
+    await uye.timeout(None, reason=sebep[:500])
+
+
+# ---------- Ceza logları ----------
+# /cezakanal      -> tüm mute ve banlar
+# /botcezakanal   -> sadece otomod (küfür/link/spam) cezaları (bunlar /cezakanal'a da düşer)
+async def ceza_logla(guild, tur, kisi, sebep, bitis=None, yetkili=None, kanal=None,
+                     mesaj=None, otomod=False, here=False):
+    ayar = json_yukle(AYAR_DOSYASI).get(str(guild.id), {})
+    hedefler = {ayar.get("cezakanal")}
+    if otomod:
+        hedefler.add(ayar.get("botcezakanal"))
+    hedefler.discard(None)
+    if not hedefler:
+        return
+
+    embed = discord.Embed(title=tur, color=discord.Color.orange(), timestamp=discord.utils.utcnow())
+    embed.add_field(name="Kişi", value=f"{kisi} (<@{kisi.id}>)", inline=False)
+    if otomod:
+        yetkili_metni = "Otomatik (bot)"
+    else:
+        yetkili_metni = f"<@{yetkili.id}>" if yetkili else "-"
+    embed.add_field(name="Yetkili", value=yetkili_metni, inline=True)
+    if bitis:
+        embed.add_field(name="Bitiş", value=f"<t:{bitis}:F> (<t:{bitis}:R>)", inline=True)
+    if kanal:
+        embed.add_field(name="Kanal", value=f"<#{kanal.id}>", inline=True)
+    embed.add_field(name="Sebep", value=sebep[:1000], inline=False)
+    if mesaj:
+        embed.add_field(name="Mesaj", value="```" + mesaj[:300].replace("`", "'") + "```", inline=False)
+
+    for kid in hedefler:
+        hedef = guild.get_channel(int(kid))
+        if hedef:
+            try:
+                await hedef.send(
+                    content="@here" if here else None,
+                    embed=embed,
+                    allowed_mentions=discord.AllowedMentions(everyone=True),
+                )
+            except discord.HTTPException:
+                pass
+
+
+# ---------- Otomod ----------
+async def otomod_mute(message: discord.Message, uye: discord.Member, saniye: int, sebep: str, here=False):
+    try:
+        bitis = await mute_uygula(uye, saniye, f"Otomod: {sebep}")
+        tur = "Otomatik Mute"
+        await dm_dene(
+            uye,
+            f"**{message.guild.name}** sunucusunda otomatik olarak susturuldun.\n"
+            f"Sebep: {sebep}\nBitiş: <t:{bitis}:F>",
+        )
+    except discord.HTTPException:
+        bitis, tur = None, "Otomatik Mute BAŞARISIZ (botun izni/rol sırasını kontrol et)"
+    await ceza_logla(message.guild, tur, uye, sebep, bitis=bitis, kanal=message.channel,
+                     mesaj=message.content, otomod=True, here=here)
+
+
+async def otomod(message: discord.Message) -> bool:
+    """Kural ihlali varsa cezayı uygular ve True döner (mesaj işlenmiş olur)."""
+    uye = message.author
+    if not isinstance(uye, discord.Member) or not message.content:
+        return False
+    p = uye.guild_permissions
+    if p.administrator or p.manage_messages or p.moderate_members:
+        return False  # Yetkililere otomod işlemez
+
+    guild = message.guild
+    icerik = message.content
+    link_var = LINK_REGEX.search(icerik) is not None
+
+    # Üst üste aynı mesaj sayacı
+    norm = " ".join(icerik.lower().split())
+    anahtar = (guild.id, uye.id)
+    s = spam_durum.get(anahtar)
+    if s and s["icerik"] == norm:
+        s["sayi"] += 1
+    else:
+        s = {"icerik": norm, "sayi": 1}
+    spam_durum[anahtar] = s
+
+    async def sil():
+        try:
+            await message.delete()
+        except discord.HTTPException:
+            pass
+
+    # 1) Spam yaparken link kullanma -> sunucudan yasakla
+    if link_var and s["sayi"] >= 2:
+        await sil()
+        spam_durum.pop(anahtar, None)
+        sebep = "Spam yaparken link kullandı"
+        try:
+            await guild.ban(uye, reason=f"Otomod: {sebep}")
+            tur = "Otomatik Ban"
+        except discord.HTTPException:
+            tur = "Otomatik Ban BAŞARISIZ (botun izni/rol sırasını kontrol et)"
+        await ceza_logla(guild, tur, uye, sebep, kanal=message.channel, mesaj=icerik, otomod=True)
+        return True
+
+    # 2) Üst üste aynı mesajı SPAM_SINIRI kez atma -> mute + log + @here
+    if s["sayi"] >= SPAM_SINIRI:
+        await sil()
+        spam_durum.pop(anahtar, None)
+        await otomod_mute(message, uye, SPAM_MUTE_SURESI,
+                          f"Üst üste {SPAM_SINIRI} kez aynı mesajı gönderdi (spam)", here=True)
+        return True
+
+    # 3) Link atma -> mute + kanalda @here uyarısı + log
+    if link_var:
+        await sil()
+        await otomod_mute(message, uye, LINK_MUTE_SURESI, "Link gönderdi")
+        try:
+            await message.channel.send(
+                f"@here {uye.mention} bu kanalda link göndermeye çalıştı ve **30 gün** susturuldu. "
+                f"Link paylaşmak yasaktır!",
+                allowed_mentions=discord.AllowedMentions(everyone=True, users=True),
+            )
+        except discord.HTTPException:
+            pass
+        return True
+
+    # 4) Küfür -> 7 gün mute + log
+    if kufur_var_mi(icerik):
+        await sil()
+        await otomod_mute(message, uye, KUFUR_MUTE_SURESI, "Küfür")
+        return True
+
+    return False
+
+
+class Bot(discord.Client):
+    def __init__(self):
+        super().__init__(intents=intents)
+        self.tree = app_commands.CommandTree(self)
+
+    async def setup_hook(self):
+        await self.tree.sync()
+        sure_kontrol.start()
+        eski_kayit_temizle.start()
+        mute_kontrol.start()
+
+
+bot = Bot()
+
+
+async def tum_sunucularda_banla(kullanici_id: int, sebep: str):
+    basarisiz = []
+    for g in bot.guilds:
+        try:
+            await g.ban(discord.Object(id=kullanici_id), reason=sebep[:500])
+        except discord.HTTPException:
+            basarisiz.append(g.name)
+    return len(bot.guilds) - len(basarisiz), basarisiz
+
+
+async def tum_sunucularda_kaldir(kullanici_id: int):
+    for g in bot.guilds:
+        try:
+            await g.unban(discord.Object(id=kullanici_id))
+        except discord.HTTPException:
+            pass  # Zaten banlı değil ya da yetki yok
+
+
+async def dm_dene(kisi: discord.abc.User, metin: str):
+    try:
+        await kisi.send(metin)
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+
+
+def ban_kontrol(interaction: discord.Interaction, kisi: discord.User):
+    g = interaction.guild
+    if kisi.id == interaction.user.id:
+        return "Kendini banlayamazsın."
+    if kisi.id == bot.user.id:
+        return "Botu banlayamazsın."
+    if kisi.id == g.owner_id:
+        return "Sunucu sahibini banlayamazsın."
+    uye = g.get_member(kisi.id)
+    if uye and interaction.user.id != g.owner_id and uye.top_role >= interaction.user.top_role:
+        return "Bu kişinin rolü seninkine eşit ya da yüksek, banlayamazsın."
+    return None
+
+
+# Süreli banların süresi dolunca otomatik kaldırır
+@tasks.loop(seconds=60)
+async def sure_kontrol():
+    veri = banlari_yukle()
+    degisti = False
+    for uid, kayit in list(veri.items()):
+        if not ban_aktif_mi(kayit):
+            await tum_sunucularda_kaldir(int(uid))
+            del veri[uid]
+            degisti = True
+    if degisti:
+        banlari_kaydet(veri)
+
+
+@sure_kontrol.before_loop
+async def sure_kontrol_hazirla():
+    await bot.wait_until_ready()
+
+
+@bot.event
+async def on_ready():
+    print(f"{bot.user} olarak giriş yapıldı.")
+    link = discord.utils.oauth_url(
+        bot.user.id, permissions=GEREKLI_IZINLER, scopes=("bot", "applications.commands")
+    )
+    print("Botu sunucuya bu linkle ekle (gerekli izinleri kendisi ister):\n" + link)
+
+
+# Bot yeni bir sunucuya eklenince: sahibine DM'den haber ver + aktif banları orada da uygula
+@bot.event
+async def on_guild_join(guild: discord.Guild):
+    sahip = bot.get_user(OWNER_KULLANICI_ID)
+    if sahip is None:
+        try:
+            sahip = await bot.fetch_user(OWNER_KULLANICI_ID)
+        except discord.HTTPException:
+            sahip = None
+    if sahip:
+        link = None
+        for kanal in guild.text_channels:
+            if kanal.permissions_for(guild.me).create_instant_invite:
+                try:
+                    link = (await kanal.create_invite(max_age=0, max_uses=0, unique=False)).url
+                    break
+                except discord.HTTPException:
+                    continue
+        metin = f"Bot yeni bir sunucuya eklendi: **{guild.name}** (ID: `{guild.id}`, {guild.member_count} üye)"
+        if link:
+            metin += f"\nDavet linki: {link}"
+        await dm_dene(sahip, metin)
+
+    for uid, kayit in banlari_yukle().items():
+        if ban_aktif_mi(kayit):
+            try:
+                await guild.ban(discord.Object(id=int(uid)), reason="Ortak ban listesi")
+            except discord.HTTPException:
+                pass
+
+
+# ---------- DM üzerinden bot kontrolü (SADECE OWNER_KULLANICI_ID) ----------
+DM_YARDIM_METNI = """**DM komutları (sadece sana özel):**
+`!sunucular` — botun bulunduğu sunucuları listeler
+`!duyuru <sunucu_id> <kanal_id> <mesaj>` — o sunucudaki kanala duyuru atar (link olabilir)
+`!mesaj <sunucu_id> <kullanici_id> <mesaj>` — o sunucudaki üyeye bot hesabından DM atar
+`!ban <kullanici_id> <sure> <sebep>` — süreli ban (örn: 7g, 2sa) — botun olduğu tüm sunucularda
+`!unban <kullanici_id>` — süreli banı kaldırır
+`!databan <kullanici_id> <sebep>` — süresiz ban — botun olduğu tüm sunucularda
+`!undataban <kullanici_id>` — süresiz banı kaldırır
+`!mute <sunucu_id> <kullanici_id> <sure> <sebep>` — o sunucuda süreli susturur
+`!unmute <sunucu_id> <kullanici_id>` — susturmayı kaldırır
+`!clear <sunucu_id> <kanal_id> <sayi>` — o kanaldaki mesajları siler (sayı yazmazsan hepsini siler)"""
+
+
+def _sayi(x):
+    try:
+        return int(x)
+    except (TypeError, ValueError):
+        return None
+
+
+def dm_hedef_kontrol(guild: discord.Guild, hedef_id: int):
+    if hedef_id == bot.user.id:
+        return "Botu hedef alamazsın."
+    if hedef_id == guild.owner_id:
+        return "Sunucu sahibini hedef alamazsın."
+    return None
+
+
+async def dm_komut_isle(message: discord.Message):
+    parcalar = message.content.strip().split(maxsplit=1)
+    komut = parcalar[0].lstrip("!").lower()
+    kalan = parcalar[1] if len(parcalar) > 1 else ""
+
+    async def soyle(m):
+        await message.channel.send(m[:2000])
+
+    if komut in ("yardim", "help"):
+        return await soyle(DM_YARDIM_METNI)
+
+    if komut == "sunucular":
+        if not bot.guilds:
+            return await soyle("Botun bulunduğu bir sunucu yok.")
+        satirlar = [f"`{g.id}` — {g.name} ({g.member_count} üye)" for g in bot.guilds]
+        return await soyle("**Botun bulunduğu sunucular:**\n" + "\n".join(satirlar))
+
+    if komut == "duyuru":
+        p = kalan.split(maxsplit=2)
+        if len(p) < 3 or _sayi(p[0]) is None or _sayi(p[1]) is None:
+            return await soyle("Kullanım: `!duyuru <sunucu_id> <kanal_id> <mesaj>`")
+        guild = bot.get_guild(_sayi(p[0]))
+        if not guild:
+            return await soyle("O sunucu bulunamadı (ID'yi `!sunucular` ile kontrol et).")
+        kanal = guild.get_channel(_sayi(p[1]))
+        if not isinstance(kanal, discord.TextChannel):
+            return await soyle("O kanal bulunamadı.")
+        try:
+            await kanal.send(p[2])
+        except discord.Forbidden:
+            return await soyle("Botun o kanala mesaj gönderme izni yok.")
+        return await soyle(f"Duyuru **{guild.name}** sunucusunda {kanal.mention} kanalına gönderildi.")
+
+    if komut == "mesaj":
+        p = kalan.split(maxsplit=2)
+        if len(p) < 3 or _sayi(p[0]) is None or _sayi(p[1]) is None:
+            return await soyle("Kullanım: `!mesaj <sunucu_id> <kullanici_id> <mesaj>`")
+        guild = bot.get_guild(_sayi(p[0]))
+        if not guild:
+            return await soyle("O sunucu bulunamadı.")
+        uye = guild.get_member(_sayi(p[1]))
+        if not uye:
+            return await soyle("O kişi o sunucuda bulunamadı.")
+        try:
+            await uye.send(p[2])
+        except discord.Forbidden:
+            return await soyle("Bu kişinin DM'leri kapalı.")
+        return await soyle(f"{uye} kişisine mesaj gönderildi.")
+
+    if komut in ("ban", "databan"):
+        p = kalan.split(maxsplit=(2 if komut == "ban" else 1))
+        if komut == "ban":
+            if len(p) < 2 or _sayi(p[0]) is None:
+                return await soyle("Kullanım: `!ban <kullanici_id> <sure> <sebep>`")
+            saniye = sure_coz(p[1])
+            if saniye is None:
+                return await soyle("Geçersiz süre. Örnekler: `30dk`, `2sa`, `7g`, `1hf`")
+            sebep = p[2] if len(p) > 2 else "Sebep belirtilmedi"
+        else:
+            if len(p) < 1 or _sayi(p[0]) is None:
+                return await soyle("Kullanım: `!databan <kullanici_id> <sebep>`")
+            sebep = p[1] if len(p) > 1 else "Sebep belirtilmedi"
+        hedef_id = _sayi(p[0])
+        try:
+            hedef = bot.get_user(hedef_id) or await bot.fetch_user(hedef_id)
+        except discord.HTTPException:
+            return await soyle("O kullanıcı bulunamadı.")
+        veri = banlari_yukle()
+        mevcut = veri.get(str(hedef_id))
+        if komut == "ban" and mevcut and mevcut["bitis"] is None:
+            return await soyle("Bu kişi zaten süresiz banlı. Önce `!undataban` yapmalı.")
+        bitis = None if komut == "databan" else int(time.time()) + saniye
+        veri[str(hedef_id)] = {"bitis": bitis, "sunucu_id": None, "sebep": sebep}
+        banlari_kaydet(veri)
+        await dm_dene(
+            hedef,
+            f"Botun olduğu sunuculardan {'süresiz' if bitis is None else 'süreli'} banlandın.\nSebep: {sebep}"
+            + (f"\nBitiş: <t:{bitis}:F>" if bitis else ""),
+        )
+        basarili, basarisiz = await tum_sunucularda_banla(hedef_id, sebep)
+        yanit = f"**{hedef}** {basarili} sunucuda banlandı."
+        if bitis:
+            yanit += f" Bitiş: <t:{bitis}:F>"
+        if basarisiz:
+            yanit += f"\nBanlanamayan sunucular: {', '.join(basarisiz)}"
+        return await soyle(yanit)
+
+    if komut in ("unban", "undataban"):
+        p = kalan.split()
+        if len(p) < 1 or _sayi(p[0]) is None:
+            return await soyle(f"Kullanım: `!{komut} <kullanici_id>`")
+        hedef_id = _sayi(p[0])
+        veri = banlari_yukle()
+        kayit = veri.get(str(hedef_id))
+        if not kayit:
+            return await soyle("Bu kişi ortak ban listesinde yok.")
+        if komut == "unban" and kayit["bitis"] is None:
+            return await soyle("Bu kişi süresiz banlı, `!undataban` kullan.")
+        if komut == "undataban" and kayit["bitis"] is not None:
+            return await soyle("Bu kişi süreli banlı, `!unban` kullan.")
+        del veri[str(hedef_id)]
+        banlari_kaydet(veri)
+        await tum_sunucularda_kaldir(hedef_id)
+        return await soyle(f"`{hedef_id}` için ban tüm sunucularda kaldırıldı.")
+
+    if komut in ("mute", "unmute"):
+        p = kalan.split(maxsplit=(3 if komut == "mute" else 1))
+        if len(p) < 2 or _sayi(p[0]) is None or _sayi(p[1]) is None:
+            return await soyle(f"Kullanım: `!{komut} <sunucu_id> <kullanici_id>" + (" <sure> <sebep>`" if komut == "mute" else "`"))
+        guild = bot.get_guild(_sayi(p[0]))
+        if not guild:
+            return await soyle("O sunucu bulunamadı.")
+        uye = guild.get_member(_sayi(p[1]))
+        if not uye:
+            return await soyle("O kişi o sunucuda bulunamadı.")
+        hata = dm_hedef_kontrol(guild, uye.id)
+        if hata:
+            return await soyle(hata)
+        try:
+            if komut == "mute":
+                if len(p) < 3:
+                    return await soyle("Kullanım: `!mute <sunucu_id> <kullanici_id> <sure> <sebep>`")
+                saniye = sure_coz(p[2])
+                if saniye is None:
+                    return await soyle("Geçersiz süre. Örnekler: `30dk`, `2sa`, `7g`, `1hf`")
+                sebep = p[3] if len(p) > 3 else "Sebep belirtilmedi"
+                bitis = await mute_uygula(uye, saniye, sebep)
+                await dm_dene(uye, f"**{guild.name}** sunucusunda susturuldun.\nSebep: {sebep}\nBitiş: <t:{bitis}:F>")
+                await ceza_logla(guild, "Mute (DM komutu)", uye, sebep, bitis=bitis, yetkili=message.author)
+                return await soyle(f"**{uye}** susturuldu. Bitiş: <t:{bitis}:F>")
+            else:
+                await mute_kaldir(uye, "DM komutuyla kaldırıldı")
+                await ceza_logla(guild, "Unmute (DM komutu)", uye, "Mute kaldırıldı", yetkili=message.author)
+                return await soyle(f"**{uye}** için susturma kaldırıldı.")
+        except discord.HTTPException:
+            return await soyle("İşlem başarısız (botun izni/rol sırasını kontrol et).")
+
+    if komut == "clear":
+        p = kalan.split()
+        if len(p) < 2 or _sayi(p[0]) is None or _sayi(p[1]) is None:
+            return await soyle("Kullanım: `!clear <sunucu_id> <kanal_id> <sayi>` (sayı yazmazsan hepsini siler)")
+        guild = bot.get_guild(_sayi(p[0]))
+        if not guild:
+            return await soyle("O sunucu bulunamadı.")
+        kanal = guild.get_channel(_sayi(p[1]))
+        if not isinstance(kanal, discord.TextChannel):
+            return await soyle("O kanal bulunamadı.")
+        sayi = _sayi(p[2]) if len(p) > 2 else None
+        try:
+            silinen = await kanal.purge(limit=sayi)
+        except discord.HTTPException:
+            return await soyle("Silinemedi (botun izni yok).")
+        return await soyle(f"{len(silinen)} mesaj silindi.")
+
+    await soyle("Bilinmeyen komut. `!yardim` yaz.")
+
+
+# 0) !format yazılınca başvuru formatını gönderir
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot:
+        return
+    if message.guild is None:  # DM: sadece owner komut verebilir
+        if message.author.id == OWNER_KULLANICI_ID and message.content.strip().startswith("!"):
+            await dm_komut_isle(message)
+        return
+    if message.guild:  # Mesajı kaydet (silinirse /silinmislistele ile görülebilsin)
+        ekler = "\n".join(a.url for a in message.attachments)
+        db.execute(
+            "INSERT OR REPLACE INTO mesajlar VALUES (?,?,?,?,?,?,?,?,NULL)",
+            (message.id, message.guild.id, message.channel.id, message.author.id,
+             message.author.display_name, message.content, ekler, int(message.created_at.timestamp())),
+        )
+        db.commit()
+        if await otomod(message):  # Küfür / link / spam kontrolü
+            return
+    if message.content.strip().lower() == "!format":
+        await message.channel.send(FORMAT_METNI)
+
+
+# 1) Yeni üye gelince: banlıysa engelle, değilse hoş geldin mesajı
+@bot.event
+async def on_member_join(member: discord.Member):
+    kayit = banlari_yukle().get(str(member.id))
+    if kayit and ban_aktif_mi(kayit):
+        try:
+            await member.guild.ban(member, reason="Ortak ban listesi")
+        except discord.HTTPException:
+            pass
+        return
+
+    kanal = discord.utils.get(member.guild.text_channels, name=HOSGELDIN_KANAL_ADI)
+    if kanal:
+        await kanal.send(f"Sunucuya hoş geldin {member.mention}! 🎉")
+    await dm_dene(
+        member,
+        "Kampımıza hoşgeldiniz, katılmak için transfer kanalındaki tike tıklayıp ardından aşağıda açılan "
+        "transfer talep kanalından ticket açıp katılabilirsiniz!",
+    )
+
+
+# 2) /davet -> arkadaşların için süreli, sınırlı davet linki üretir
+@bot.tree.command(name="davet", description="Arkadaşların için davet linki oluşturur")
+@app_commands.describe(kullanim="Kaç kişi kullanabilsin", saat="Kaç saat geçerli olsun")
+async def davet(interaction: discord.Interaction, kullanim: int = 5, saat: int = 24):
+    if not interaction.guild:
+        return await interaction.response.send_message("Bu komut sadece sunucuda çalışır.", ephemeral=True)
+    link = await interaction.channel.create_invite(max_uses=kullanim, max_age=saat * 3600, unique=True)
+    await interaction.response.send_message(
+        f"Davet linkin ({kullanim} kullanım, {saat} saat geçerli):\n{link.url}", ephemeral=True
+    )
+
+
+# 3) /mesaj -> SADECE sunucu sahibi. Sunucudaki bir üyeye botun hesabından DM atar
+@bot.tree.command(name="mesaj", description="Sunucudaki bir üyeye bot hesabından özel mesaj gönderir (sadece sunucu sahibi)")
+@app_commands.describe(kisi="Mesajın gideceği kişi", metin="Mesaj")
+@app_commands.guild_only()
+async def mesaj(interaction: discord.Interaction, kisi: discord.Member, metin: str):
+    if interaction.user.id != interaction.guild.owner_id:
+        return await interaction.response.send_message(
+            "`/mesaj` komutunu sadece **sunucu sahibi** kullanabilir.", ephemeral=True
+        )
+    try:
+        await kisi.send(metin)  # Mesaj botun hesabından, olduğu gibi gider
+        await interaction.response.send_message(f"{kisi.display_name} kişisine mesaj gönderildi.", ephemeral=True)
+    except discord.Forbidden:
+        await interaction.response.send_message("Bu kişinin DM'leri kapalı.", ephemeral=True)
+
+
+# 4) /duyuru -> sadece yöneticiler, bulunduğu kanala embed duyuru atar
+@bot.tree.command(name="duyuru", description="Seçtiğin kanala duyuru gönderir (yönetici, link olabilir)")
+@app_commands.describe(kanal="Duyurunun atılacağı kanal", metin="Duyuru metni (link olabilir)", baslik="Başlık (opsiyonel)")
+@app_commands.default_permissions(administrator=True)
+async def duyuru(interaction: discord.Interaction, kanal: discord.TextChannel, metin: str, baslik: str = None):
+    if not kanal.permissions_for(interaction.guild.me).send_messages:
+        return await interaction.response.send_message(f"Botun {kanal.mention} kanalına mesaj gönderme izni yok.", ephemeral=True)
+    if baslik:
+        embed = discord.Embed(title=baslik, description=metin, color=discord.Color.blurple())
+        embed.set_footer(text=f"Duyuruyu yapan: {interaction.user.display_name}")
+        await kanal.send(embed=embed)
+    else:
+        await kanal.send(metin)  # Başlıksız: linkler Discord'da otomatik önizlenir
+    await interaction.response.send_message(f"Duyuru {kanal.mention} kanalına gönderildi.", ephemeral=True)
+
+
+# 5) /clear -> kanaldaki mesajları siler (sayı verilmezse hepsini siler)
+@bot.tree.command(name="clear", description="Kanaldaki mesajları siler (sayı yazmazsan hepsini siler)")
+@app_commands.describe(sayi="Silinecek mesaj sayısı (boş bırakırsan kanaldaki tüm mesajlar silinir)")
+@app_commands.default_permissions(manage_messages=True)
+@app_commands.checks.has_permissions(manage_messages=True)
+@app_commands.checks.bot_has_permissions(manage_messages=True, read_message_history=True)
+async def clear(interaction: discord.Interaction, sayi: app_commands.Range[int, 1, 10000] = None):
+    await interaction.response.defer(ephemeral=True)  # Silme uzun sürebilir
+    def kaydet(m: discord.Message) -> bool:
+        clear_idleri.add(m.id)  # Bu mesajlar yetkili tarafından silindi, listeye girmesin
+        return True
+
+    silinen = await interaction.channel.purge(limit=sayi, check=kaydet)  # limit=None -> hepsi
+    await interaction.followup.send(f"{len(silinen)} mesaj silindi.", ephemeral=True)
+
+
+@clear.error
+async def clear_hata(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    await izin_hatasi(interaction, error, "Mesajları Yönet")
+
+
+async def izin_hatasi(interaction: discord.Interaction, error, izin_adi: str):
+    if isinstance(error, app_commands.MissingPermissions):
+        msg = f"Bu komut için **{izin_adi}** iznin olmalı."
+    elif isinstance(error, app_commands.BotMissingPermissions):
+        msg = f"Botun bu sunucuda gerekli izinleri yok ({izin_adi} vb.)."
+    else:
+        msg = f"Bir hata oluştu: {error}"
+    if interaction.response.is_done():
+        await interaction.followup.send(msg, ephemeral=True)
+    else:
+        await interaction.response.send_message(msg, ephemeral=True)
+
+
+# 6) /ban -> SÜRELİ ban. Süre dolana kadar botun olduğu hiçbir sunucuya giremez
+@bot.tree.command(name="ban", description="Süreli ban: süre boyunca botun olduğu hiçbir sunucuya giremez")
+@app_commands.describe(
+    kisi="Banlanacak kişi (sunucuda değilse kullanıcı ID'sini yapıştır)",
+    sure="Süre: 30dk, 2sa, 7g, 1hf gibi",
+    sebep="Ban sebebi",
+)
+@app_commands.guild_only()
+@app_commands.default_permissions(ban_members=True)
+@app_commands.checks.has_permissions(ban_members=True)
+@app_commands.checks.bot_has_permissions(ban_members=True)
+async def ban(interaction: discord.Interaction, kisi: discord.User, sure: str, sebep: str = "Sebep belirtilmedi"):
+    saniye = sure_coz(sure)
+    if saniye is None:
+        return await interaction.response.send_message(
+            "Geçersiz süre. Örnekler: `30dk`, `2sa`, `7g`, `1hf`", ephemeral=True
+        )
+    hata = ban_kontrol(interaction, kisi)
+    if hata:
+        return await interaction.response.send_message(hata, ephemeral=True)
+
+    veri = banlari_yukle()
+    mevcut = veri.get(str(kisi.id))
+    if mevcut and mevcut["bitis"] is None:
+        return await interaction.response.send_message(
+            "Bu kişi zaten süresiz banlı (/databan). Önce sunucu sahibi `/undataban` yapmalı.", ephemeral=True
+        )
+
+    await interaction.response.defer(ephemeral=True)
+    bitis = int(time.time()) + saniye
+    veri[str(kisi.id)] = {"bitis": bitis, "sunucu_id": interaction.guild.id, "sebep": sebep}
+    banlari_kaydet(veri)
+
+    await dm_dene(kisi, f"**{interaction.guild.name}** sunucusunda süreli banlandın.\nSebep: {sebep}\nBitiş: <t:{bitis}:F>")
+    basarili, basarisiz = await tum_sunucularda_banla(kisi.id, f"{interaction.user}: {sebep} (bitiş: <t:{bitis}:f>)")
+    await ceza_logla(interaction.guild, "Süreli Ban", kisi, sebep, bitis=bitis, yetkili=interaction.user)
+
+    mesaj_ = f"**{kisi}** {basarili} sunucuda banlandı. Bitiş: <t:{bitis}:F> (<t:{bitis}:R>)"
+    if basarisiz:
+        mesaj_ += f"\nBanlanamayan sunucular (botun izni/rol sırasını kontrol et): {', '.join(basarisiz)}"
+    await interaction.followup.send(mesaj_, ephemeral=True)
+
+
+@ban.error
+async def ban_hata(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    await izin_hatasi(interaction, error, "Üyeleri Yasakla")
+
+
+# 7) /databan -> SÜRESİZ ban. Sadece sunucu sahibi atabilir ve /undataban ile kaldırabilir.
+#    Kişi sunucuda olmasa da, süreli banı olsa da ban işler (süreli ban süresize çevrilir).
+@bot.tree.command(name="databan", description="Süresiz ban (sadece sunucu sahibi): botun olduğu hiçbir sunucuya giremez")
+@app_commands.describe(
+    kisi="Banlanacak kişi (sunucuda değilse kullanıcı ID'sini yapıştır)",
+    sebep="Ban sebebi",
+)
+@app_commands.guild_only()
+@app_commands.checks.bot_has_permissions(ban_members=True)
+async def databan(interaction: discord.Interaction, kisi: discord.User, sebep: str = "Sebep belirtilmedi"):
+    # Sadece sunucu sahibi kullanabilir
+    if interaction.user.id != interaction.guild.owner_id:
+        return await interaction.response.send_message(
+            "`/databan` komutunu sadece **sunucu sahibi** kullanabilir.", ephemeral=True
+        )
+    hata = ban_kontrol(interaction, kisi)
+    if hata:
+        return await interaction.response.send_message(hata, ephemeral=True)
+
+    await interaction.response.defer(ephemeral=True)
+    veri = banlari_yukle()
+    veri[str(kisi.id)] = {"bitis": None, "sunucu_id": interaction.guild.id, "sebep": sebep}
+    banlari_kaydet(veri)
+
+    await dm_dene(kisi, f"**{interaction.guild.name}** sunucusunda süresiz banlandın.\nSebep: {sebep}")
+    basarili, basarisiz = await tum_sunucularda_banla(kisi.id, f"{interaction.user}: {sebep} (süresiz)")
+    await ceza_logla(interaction.guild, "Süresiz Ban (databan)", kisi, sebep, yetkili=interaction.user)
+
+    mesaj_ = f"**{kisi}** {basarili} sunucuda süresiz banlandı. Banı sadece sunucu sahibi `/undataban` ile kaldırabilir."
+    if basarisiz:
+        mesaj_ += f"\nBanlanamayan sunucular (botun izni/rol sırasını kontrol et): {', '.join(basarisiz)}"
+    await interaction.followup.send(mesaj_, ephemeral=True)
+
+
+@databan.error
+async def databan_hata(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    await izin_hatasi(interaction, error, "Üyeleri Yasakla")
+
+
+# 8) /unban -> SÜRELİ banı kaldırır (Üyeleri Yasakla izni olan herkes kullanabilir)
+@bot.tree.command(name="unban", description="Süreli banı kaldırır")
+@app_commands.describe(kisi="Banı kaldırılacak kişi (kullanıcı ID'sini yapıştırabilirsin)")
+@app_commands.guild_only()
+@app_commands.default_permissions(ban_members=True)
+@app_commands.checks.has_permissions(ban_members=True)
+async def unban(interaction: discord.Interaction, kisi: discord.User):
+    veri = banlari_yukle()
+    kayit = veri.get(str(kisi.id))
+    if not kayit:
+        # Ortak listede yok: bu sunucudaki normal ban ya da otomod banı olabilir
+        await interaction.response.defer(ephemeral=True)
+        try:
+            await interaction.guild.unban(kisi, reason=f"{interaction.user} tarafından kaldırıldı")
+        except discord.NotFound:
+            return await interaction.followup.send("Bu kişi bu sunucuda banlı değil.", ephemeral=True)
+        except discord.HTTPException:
+            return await interaction.followup.send("Ban kaldırılamadı (botun Üyeleri Yasakla izni var mı?).", ephemeral=True)
+        await ceza_logla(interaction.guild, "Unban", kisi, "Ban kaldırıldı", yetkili=interaction.user)
+        return await interaction.followup.send(f"**{kisi}** için bu sunucudaki ban kaldırıldı.", ephemeral=True)
+    if kayit["bitis"] is None:
+        return await interaction.response.send_message(
+            "Bu kişi **süresiz** banlı (/databan). Kaldırmak için sunucu sahibi `/undataban` kullanmalı.",
+            ephemeral=True,
+        )
+
+    await interaction.response.defer(ephemeral=True)
+    del veri[str(kisi.id)]
+    banlari_kaydet(veri)
+    await tum_sunucularda_kaldir(kisi.id)
+    await ceza_logla(interaction.guild, "Unban (süreli ban kaldırıldı)", kisi, "Ban kaldırıldı", yetkili=interaction.user)
+    await interaction.followup.send(f"**{kisi}** için süreli ban tüm sunucularda kaldırıldı.", ephemeral=True)
+
+
+@unban.error
+async def unban_hata(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    await izin_hatasi(interaction, error, "Üyeleri Yasakla")
+
+
+# 8b) /undataban -> SÜRESİZ banı kaldırır. SADECE banı koyan sunucunun sahibi kullanabilir
+@bot.tree.command(name="undataban", description="Süresiz banı kaldırır (sadece sunucu sahibi)")
+@app_commands.describe(kisi="Süresiz banı kaldırılacak kişi (kullanıcı ID'sini yapıştırabilirsin)")
+@app_commands.guild_only()
+async def undataban(interaction: discord.Interaction, kisi: discord.User):
+    veri = banlari_yukle()
+    kayit = veri.get(str(kisi.id))
+    if not kayit:
+        return await interaction.response.send_message("Bu kişi ortak ban listesinde yok.", ephemeral=True)
+    if kayit["bitis"] is not None:
+        return await interaction.response.send_message(
+            "Bu kişinin banı süreli. Kaldırmak için `/unban` kullan.", ephemeral=True
+        )
+
+    ban_sunucusu = bot.get_guild(kayit["sunucu_id"])
+    sahip_id = ban_sunucusu.owner_id if ban_sunucusu else interaction.guild.owner_id
+    if interaction.user.id != sahip_id:
+        return await interaction.response.send_message(
+            "Süresiz banı sadece bu banı koyan sunucunun **sahibi** kaldırabilir.", ephemeral=True
+        )
+
+    await interaction.response.defer(ephemeral=True)
+    del veri[str(kisi.id)]
+    banlari_kaydet(veri)
+    await tum_sunucularda_kaldir(kisi.id)
+    await ceza_logla(interaction.guild, "Undataban (süresiz ban kaldırıldı)", kisi, "Ban kaldırıldı", yetkili=interaction.user)
+    await interaction.followup.send(f"**{kisi}** için süresiz ban tüm sunucularda kaldırıldı.", ephemeral=True)
+
+
+# 9) Silinen mesajları kaydet + /silinmislistele (sadece yetkililer)
+def silindi_isaretle(mesaj_idleri):
+    simdi = int(time.time())
+    for mid in mesaj_idleri:
+        if mid in clear_idleri:  # /clear ile silinmiş, listeye alma
+            clear_idleri.discard(mid)
+            continue
+        db.execute("UPDATE mesajlar SET silinme=? WHERE id=? AND silinme IS NULL", (simdi, mid))
+    db.commit()
+
+
+@bot.event
+async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent):
+    if payload.guild_id:
+        silindi_isaretle([payload.message_id])
+
+
+@bot.event
+async def on_raw_bulk_message_delete(payload: discord.RawBulkMessageDeleteEvent):
+    if payload.guild_id:
+        silindi_isaretle(payload.message_ids)
+
+
+@tasks.loop(hours=1)
+async def eski_kayit_temizle():
+    sinir = int(time.time()) - MESAJ_SAKLAMA_GUN * 86400
+    db.execute("DELETE FROM mesajlar WHERE yazilma < ?", (sinir,))
+    db.commit()
+
+
+@bot.tree.command(name="silinmislistele", description="Silinen mesajları listeler (sadece yetkililer)")
+@app_commands.describe(
+    sayi="Kaç mesaj listelensin (1-25)",
+    kisi="Sadece bu kişinin silinen mesajlarını göster (isteğe bağlı)",
+)
+@app_commands.guild_only()
+@app_commands.default_permissions(manage_messages=True)
+@app_commands.checks.has_permissions(manage_messages=True)
+async def silinmislistele(
+    interaction: discord.Interaction,
+    sayi: app_commands.Range[int, 1, 25] = 10,
+    kisi: discord.User = None,
+):
+    sorgu = ("SELECT yazar_id, yazar_ad, kanal_id, icerik, ekler, silinme FROM mesajlar "
+             "WHERE sunucu_id=? AND silinme IS NOT NULL")
+    parametre = [interaction.guild.id]
+    if kisi:
+        sorgu += " AND yazar_id=?"
+        parametre.append(kisi.id)
+    sorgu += " ORDER BY silinme DESC LIMIT ?"
+    parametre.append(sayi)
+    satirlar = db.execute(sorgu, parametre).fetchall()
+
+    if not satirlar:
+        return await interaction.response.send_message("Kayıtlı silinmiş mesaj bulunamadı.", ephemeral=True)
+
+    parcalar = []
+    for yazar_id, ad, kanal_id, icerik, ekler, silinme in satirlar:
+        metin = icerik if icerik else "*(metin yok)*"
+        if len(metin) > 300:
+            metin = metin[:300] + "…"
+        satir = f"**{ad}** (<@{yazar_id}>) • <#{kanal_id}> • silindi <t:{silinme}:R>\n> " + metin.replace("\n", "\n> ")
+        if ekler:
+            satir += f"\n📎 {ekler}"
+        parcalar.append(satir)
+
+    aciklama = "\n\n".join(parcalar)
+    if len(aciklama) > 4000:
+        aciklama = aciklama[:4000] + "…"
+    embed = discord.Embed(
+        title=f"Silinen son {len(satirlar)} mesaj", description=aciklama, color=discord.Color.red()
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@silinmislistele.error
+async def silinmislistele_hata(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    await izin_hatasi(interaction, error, "Mesajları Yönet")
+
+
+# 10) /mute, /unmute (Üyeleri Zaman Aşımına Uğrat izni olanlar)
+def mute_engeli(interaction: discord.Interaction, kisi: discord.Member):
+    g = interaction.guild
+    if kisi.id == interaction.user.id:
+        return "Kendini susturamazsın."
+    if kisi.id == bot.user.id:
+        return "Botu susturamazsın."
+    if kisi.id == g.owner_id:
+        return "Sunucu sahibini susturamazsın."
+    if interaction.user.id != g.owner_id and kisi.top_role >= interaction.user.top_role:
+        return "Bu kişinin rolü seninkine eşit ya da yüksek, susturamazsın."
+    return None
+
+
+@bot.tree.command(name="mute", description="Üyeyi belirtilen süre boyunca susturur")
+@app_commands.describe(kisi="Susturulacak kişi", sure="Süre: 30dk, 2sa, 7g, 1hf gibi", sebep="Sebep")
+@app_commands.guild_only()
+@app_commands.default_permissions(moderate_members=True)
+@app_commands.checks.has_permissions(moderate_members=True)
+@app_commands.checks.bot_has_permissions(moderate_members=True)
+async def mute(interaction: discord.Interaction, kisi: discord.Member, sure: str, sebep: str = "Sebep belirtilmedi"):
+    saniye = sure_coz(sure)
+    if saniye is None:
+        return await interaction.response.send_message(
+            "Geçersiz süre. Örnekler: `30dk`, `2sa`, `7g`, `1hf`", ephemeral=True
+        )
+    hata = mute_engeli(interaction, kisi)
+    if hata:
+        return await interaction.response.send_message(hata, ephemeral=True)
+
+    await interaction.response.defer(ephemeral=True)
+    try:
+        bitis = await mute_uygula(kisi, saniye, f"{interaction.user}: {sebep}")
+    except discord.HTTPException:
+        return await interaction.followup.send(
+            "Susturulamadı. Botun rolü, kişinin rolünün üstünde olmalı ve **Üyeleri Zaman Aşımına Uğrat** izni olmalı "
+            "(yöneticiler susturulamaz).", ephemeral=True)
+    await dm_dene(kisi, f"**{interaction.guild.name}** sunucusunda susturuldun.\nSebep: {sebep}\nBitiş: <t:{bitis}:F>")
+    await ceza_logla(interaction.guild, "Mute", kisi, sebep, bitis=bitis, yetkili=interaction.user)
+    await interaction.followup.send(
+        f"**{kisi.display_name}** susturuldu. Bitiş: <t:{bitis}:F> (<t:{bitis}:R>)", ephemeral=True
+    )
+
+
+@mute.error
+async def mute_hata(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    await izin_hatasi(interaction, error, "Üyeleri Zaman Aşımına Uğrat")
+
+
+@bot.tree.command(name="unmute", description="Susturmayı kaldırır")
+@app_commands.describe(kisi="Susturması kaldırılacak kişi")
+@app_commands.guild_only()
+@app_commands.default_permissions(moderate_members=True)
+@app_commands.checks.has_permissions(moderate_members=True)
+@app_commands.checks.bot_has_permissions(moderate_members=True)
+async def unmute(interaction: discord.Interaction, kisi: discord.Member):
+    await interaction.response.defer(ephemeral=True)
+    try:
+        await mute_kaldir(kisi, f"{interaction.user} tarafından kaldırıldı")
+    except discord.HTTPException:
+        return await interaction.followup.send("Susturma kaldırılamadı (botun izni/rol sırasını kontrol et).", ephemeral=True)
+    await ceza_logla(interaction.guild, "Unmute", kisi, "Mute kaldırıldı", yetkili=interaction.user)
+    await interaction.followup.send(f"**{kisi.display_name}** için susturma kaldırıldı.", ephemeral=True)
+
+
+@unmute.error
+async def unmute_hata(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    await izin_hatasi(interaction, error, "Üyeleri Zaman Aşımına Uğrat")
+
+
+# 11) Uzun mute'ları (28 günden fazla) sürdürme + elle kaldırılan mute'ları takip etme
+@tasks.loop(minutes=5)
+async def mute_kontrol():
+    kayitlar = json_yukle(MUTE_DOSYASI)
+    simdi = int(time.time())
+    degisti = False
+    for anahtar, k in list(kayitlar.items()):
+        if k["bitis"] <= simdi:
+            del kayitlar[anahtar]
+            degisti = True
+            continue
+        # Mevcut zaman aşımı parçası bitmek üzere ve mute daha bitmedi -> uzat
+        if k["bitis"] > k["kesim"] and k["kesim"] - simdi < 900:
+            gid, uid = (int(x) for x in anahtar.split(":"))
+            guild = bot.get_guild(gid)
+            uye = guild.get_member(uid) if guild else None
+            if uye:
+                parca = min(k["bitis"] - simdi, MAKS_TIMEOUT)
+                try:
+                    await uye.timeout(timedelta(seconds=parca), reason="Mute devam ediyor")
+                    k["kesim"] = simdi + parca
+                    degisti = True
+                except discord.HTTPException:
+                    pass
+    if degisti:
+        json_kaydet(MUTE_DOSYASI, kayitlar)
+
+
+@mute_kontrol.before_loop
+async def mute_kontrol_hazirla():
+    await bot.wait_until_ready()
+
+
+@bot.event
+async def on_member_update(before: discord.Member, after: discord.Member):
+    # Biri zaman aşımını Discord'dan elle kaldırdıysa kaydı sil (bot yeniden uygulamasın)
+    if before.timed_out_until and not after.timed_out_until:
+        anahtar = f"{after.guild.id}:{after.id}"
+        kayitlar = json_yukle(MUTE_DOSYASI)
+        k = kayitlar.get(anahtar)
+        if k and time.time() < k["kesim"] - 120:
+            del kayitlar[anahtar]
+            json_kaydet(MUTE_DOSYASI, kayitlar)
+
+
+# 12) /botcezakanal ve /cezakanal -> log kanallarını belirler (Sunucuyu Yönet izni)
+async def log_kanali_ayarla(interaction: discord.Interaction, anahtar: str, kanal: discord.TextChannel, aciklama: str):
+    if not kanal.permissions_for(interaction.guild.me).send_messages:
+        return await interaction.response.send_message(
+            f"Botun {kanal.mention} kanalına mesaj gönderme izni yok. Önce izni ver, sonra tekrar dene.", ephemeral=True
+        )
+    ayarlar = json_yukle(AYAR_DOSYASI)
+    ayarlar.setdefault(str(interaction.guild.id), {})[anahtar] = kanal.id
+    json_kaydet(AYAR_DOSYASI, ayarlar)
+    await interaction.response.send_message(f"{aciklama} artık {kanal.mention} kanalına gidecek.", ephemeral=True)
+
+
+@bot.tree.command(name="botcezakanal", description="Otomod (küfür/link/spam) cezalarının loglanacağı kanalı belirler")
+@app_commands.describe(kanal="Log kanalı")
+@app_commands.guild_only()
+@app_commands.default_permissions(manage_guild=True)
+@app_commands.checks.has_permissions(manage_guild=True)
+async def botcezakanal(interaction: discord.Interaction, kanal: discord.TextChannel):
+    await log_kanali_ayarla(interaction, "botcezakanal", kanal, "Otomod ceza logları")
+
+
+@botcezakanal.error
+async def botcezakanal_hata(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    await izin_hatasi(interaction, error, "Sunucuyu Yönet")
+
+
+@bot.tree.command(name="cezakanal", description="Tüm mute ve banların loglanacağı kanalı belirler")
+@app_commands.describe(kanal="Log kanalı")
+@app_commands.guild_only()
+@app_commands.default_permissions(manage_guild=True)
+@app_commands.checks.has_permissions(manage_guild=True)
+async def cezakanal(interaction: discord.Interaction, kanal: discord.TextChannel):
+    await log_kanali_ayarla(interaction, "cezakanal", kanal, "Tüm mute/ban logları")
+
+
+@cezakanal.error
+async def cezakanal_hata(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    await izin_hatasi(interaction, error, "Sunucuyu Yönet")
+
+
+# 13) /ping ve /bilgi
+@bot.tree.command(name="ping", description="Botun gecikmesini gösterir")
+async def ping(interaction: discord.Interaction):
+    await interaction.response.send_message(f"Pong! {round(bot.latency * 1000)} ms")
+
+
+@bot.tree.command(name="bilgi", description="Sunucu bilgisi")
+async def bilgi(interaction: discord.Interaction):
+    g = interaction.guild
+    await interaction.response.send_message(f"**{g.name}** — {g.member_count} üye")
+
+
+bot.run(TOKEN)
