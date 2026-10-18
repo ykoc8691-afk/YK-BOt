@@ -5,17 +5,60 @@ import time
 import discord
 from discord import app_commands
 import sqlite3
+import aiohttp
 from datetime import timedelta
 from discord.ext import tasks
 
 TOKEN = os.getenv("DISCORD_TOKEN")  # Token'ı koda yazma, ortam değişkeni olarak ver
 HOSGELDIN_KANAL_ADI = "genel"       # Hoş geldin mesajının atılacağı kanal
+SOHBET_KANAL_ADI = "sohbet"         # Transfer bilgisinin kişiyi etiketleyerek atılacağı kanal
+HOSGELDIN_METNI = (
+    "Kampımıza hoşgeldiniz, katılmak için transfer kanalındaki tike tıklayıp ardından aşağıda açılan "
+    "transfer talep kanalından ticket açıp katılabilirsiniz!"
+)
 BAN_DOSYASI = "banlar.json"         # Ortak ban listesi (silme!)
 MESAJ_DB = "mesajlar.db"            # Mesaj kayıtları (silinmiş mesaj listesi için)
 MESAJ_SAKLAMA_GUN = 30              # Kayıtlar bu kadar gün sonra otomatik silinir
 AYAR_DOSYASI = "ayarlar.json"       # /botcezakanal ve /cezakanal kanal ayarları
 MUTE_DOSYASI = "mutelar.json"       # Aktif mute kayıtları (silme!)
 OWNER_KULLANICI_ID = 1221139908471558144  # Sadece bu kullanıcı botu DM'den kontrol edebilir
+
+# ---------- Yapay zeka (Gemini, ücretsiz) ----------
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")  # Railway'de Variables'a eklenecek
+GEMINI_MODEL = "gemini-2.0-flash"             # AI Studio'da ücretsiz katmanda olan model
+AI_GECMIS_MESAJ = 8                           # Cevap verirken kaç önceki mesajı bağlam olarak okusun
+AI_SISTEM_PROMPTU = (
+    "Sen bir Discord kampı sunucusunun botusun. Sert, agresif, sivri dilli ve sabırsız bir üslubun var; "
+    "yaltaklanmaz, uzun uzun özür dilemezsin, laf sokarsın. Ama KÜFÜR ETMEZSİN, hakaret/ırkçılık/cinsiyetçilik "
+    "yapmazsın, kimseyi gerçekten tehdit etmezsin ve yasa dışı hiçbir şeye yardım etmezsin — bunlar tartışmaya "
+    "kapalı sınırlar. Cevapların kısa ve Türkçe olsun, gereksiz uzatma."
+)
+
+
+async def gemini_cevap(soru: str, baglam: str) -> str:
+    if not GEMINI_API_KEY:
+        return "Yapay zeka şu an kapalı (GEMINI_API_KEY tanımlı değil)."
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+    gövde = {
+        "system_instruction": {"parts": [{"text": AI_SISTEM_PROMPTU}]},
+        "contents": [{"role": "user", "parts": [{"text": f"{baglam}\n\nSoru: {soru}"}]}],
+        "generationConfig": {"maxOutputTokens": 300},
+    }
+    try:
+        async with aiohttp.ClientSession() as oturum:
+            async with oturum.post(url, json=gövde, timeout=aiohttp.ClientTimeout(total=20)) as yanit:
+                veri = await yanit.json()
+                if yanit.status != 200:
+                    hata = veri.get("error", {}).get("message", "bilinmeyen hata")
+                    return f"Şu an cevap veremiyorum, teknik sorun var: {hata[:200]}"
+                adaylar = veri.get("candidates", [])
+                if not adaylar:
+                    return "Diyecek bir şey bulamadım."
+                parcalar = adaylar[0].get("content", {}).get("parts", [])
+                metin = "".join(p.get("text", "") for p in parcalar).strip()
+                return metin[:1900] if metin else "Diyecek bir şey bulamadım."
+    except Exception:
+        return "Şu an cevap veremiyorum, bağlantı sorunu var."
 
 # ---------- Otomod ayarları ----------
 KUFUR_MUTE_SURESI = 7 * 86400   # Küfür: 7 gün mute
@@ -617,6 +660,27 @@ async def on_message(message: discord.Message):
             return
     if message.content.strip().lower() == "!format":
         await message.channel.send(FORMAT_METNI)
+        return
+
+    # Mesaj botun etiketiyle BAŞLIYORSA yapay zeka cevap versin
+    etiketler = (f"<@{bot.user.id}>", f"<@!{bot.user.id}>")
+    icerik = message.content.strip()
+    if icerik.startswith(etiketler):
+        soru = icerik
+        for e in etiketler:
+            soru = soru.replace(e, "", 1)
+        soru = soru.strip()
+        if not soru:
+            return
+        async with message.channel.typing():
+            gecmis = []
+            async for onceki in message.channel.history(limit=AI_GECMIS_MESAJ, before=message):
+                if onceki.content:
+                    gecmis.append(f"{onceki.author.display_name}: {onceki.content}")
+            gecmis.reverse()
+            baglam = "Son konuşmalar:\n" + "\n".join(gecmis) if gecmis else ""
+            cevap = await gemini_cevap(soru, baglam)
+        await message.reply(cevap, mention_author=False)
 
 
 # 1) Yeni üye gelince: banlıysa engelle, değilse hoş geldin mesajı
@@ -633,11 +697,15 @@ async def on_member_join(member: discord.Member):
     kanal = discord.utils.get(member.guild.text_channels, name=HOSGELDIN_KANAL_ADI)
     if kanal:
         await kanal.send(f"Sunucuya hoş geldin {member.mention}! 🎉")
-    await dm_dene(
-        member,
-        "Kampımıza hoşgeldiniz, katılmak için transfer kanalındaki tike tıklayıp ardından aşağıda açılan "
-        "transfer talep kanalından ticket açıp katılabilirsiniz!",
-    )
+
+    sohbet = discord.utils.get(member.guild.text_channels, name=SOHBET_KANAL_ADI)
+    if sohbet:
+        try:
+            await sohbet.send(f"{member.mention} {HOSGELDIN_METNI}")
+        except discord.HTTPException:
+            pass
+
+    await dm_dene(member, HOSGELDIN_METNI)
 
 
 # 2) /davet -> arkadaşların için süreli, sınırlı davet linki üretir
