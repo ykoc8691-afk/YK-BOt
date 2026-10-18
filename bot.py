@@ -1238,11 +1238,17 @@ async def _mesaj_isle(message: discord.Message):
             yonetim_baglami = await sohbet_baglami(message)
         if not yap_m and yap_yetkilisi_mi(message.author.id, message.guild) and (
                 yonetim_gibi_mi(soru) or yonetim_gibi_mi(yonetim_baglami)):
-            async with message.channel.typing():
-                islemler, not_ = await yap_hazirla(message.guild, soru, message.channel, yonetim_baglami)
-            if islemler is None:  # Yapay zeka cevap vermedi / JSON bozuk: sohbete düşüp uydurma cevap verme
-                await message.reply(not_, mention_author=False)
-                return
+            # Hemen görünür bir cevap ver; sonucu aynı mesajı düzenleyerek yaz (takılırsa nerede takıldığı belli olsun)
+            durum = await message.reply("🛠️ İsteğini inceliyorum...", mention_author=False)
+            try:
+                islemler, not_ = await asyncio.wait_for(
+                    yap_hazirla(message.guild, soru, message.channel, yonetim_baglami), timeout=100)
+            except asyncio.TimeoutError:
+                print("YONETIM: zaman aşımı")
+                return await durum.edit(content="Yapay zeka çok geç cevap verdi, biraz sonra tekrar dene.")
+            print("YONETIM:", "islemler=", islemler, "not=", not_)
+            if islemler is None:  # Yapay zeka cevap vermedi / JSON bozuk
+                return await durum.edit(content=not_)
             if islemler:
                 sorgular, degisiklikler = sorgu_ayir(message.guild, islemler)
                 metin = "\n".join(sorgular)
@@ -1253,12 +1259,14 @@ async def _mesaj_isle(message: discord.Message):
                     gorunum = YapOnay(message.guild, degisiklikler, {OWNER_KULLANICI_ID, message.guild.owner_id})
                 elif not_:
                     metin += f"\nNot: {not_}"
-                await message.reply(metin[:1900], view=gorunum, mention_author=False)
-                return
-            if islemler is not None and not_:
-                await message.reply(f"Bunu yapamıyorum: {not_}"[:1900], mention_author=False)
-                return
-            # Yönetim isteği değil (ya da yapay zeka cevap vermedi) -> aşağıda normal sohbet cevabı
+                return await durum.edit(content=metin[:1900], view=gorunum)
+            if not_:
+                return await durum.edit(content=f"Bunu yapamıyorum: {not_}"[:1900])
+            # Yönetim isteği değilmiş: durum mesajını sil, aşağıda normal sohbet cevabı verilsin
+            try:
+                await durum.delete()
+            except discord.HTTPException:
+                pass
         # Kota koruma: aynı kişi çok sık sorarsa API'ye gitmeden ⏳ ile işaretle
         simdi = time.time()
         if simdi - ai_son_kullanim.get(message.author.id, 0) < AI_BEKLEME_SANIYE:
