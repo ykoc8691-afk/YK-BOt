@@ -26,7 +26,7 @@ OWNER_KULLANICI_ID = 1221139908471558144  # Sadece bu kullanıcı botu DM'den ko
 
 # ---------- Yapay zeka (Gemini, ücretsiz) ----------
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")  # Railway'de Variables'a eklenecek
-GEMINI_MODEL = "gemini-3.8-flash"             # AI Studio'da ücretsiz katmanda olan model
+GEMINI_MODEL = "gemini-3.5-flash-lite"        # En hızlı/hafif Flash-Lite modeli (daha yüksek ücretsiz kota hedefi)
 AI_GECMIS_MESAJ = 4                           # Cevap verirken kaç önceki mesajı bağlam olarak okusun (az = daha az kota harcar)
 AI_BEKLEME_SANIYE = 20                        # Aynı kişi art arda soruyu bu kadar saniyede bir sorabilir (kota koruma)
 ai_son_kullanim = {}                          # kullanıcı_id -> son AI kullanım zamanı
@@ -38,9 +38,14 @@ AI_SISTEM_PROMPTU = (
 )
 
 
-async def gemini_cevap(soru: str, baglam: str) -> str:
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")      # Yedek ücretsiz yapay zeka (Gemini çalışmazsa devreye girer)
+GROQ_MODEL = "llama-3.3-70b-versatile"
+
+
+async def _gemini_dene(soru: str, baglam: str):
+    """Başarılıysa metin, başarısızsa None döner."""
     if not GEMINI_API_KEY:
-        return "Yapay zeka şu an kapalı (GEMINI_API_KEY tanımlı değil)."
+        return None
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
     gövde = {
         "system_instruction": {"parts": [{"text": AI_SISTEM_PROMPTU}]},
@@ -50,20 +55,56 @@ async def gemini_cevap(soru: str, baglam: str) -> str:
     try:
         async with aiohttp.ClientSession() as oturum:
             async with oturum.post(url, json=gövde, timeout=aiohttp.ClientTimeout(total=20)) as yanit:
-                veri = await yanit.json()
-                if yanit.status == 429:
-                    return "Ücretsiz yapay zeka limitim doldu, biraz sonra tekrar dene."
                 if yanit.status != 200:
-                    hata = veri.get("error", {}).get("message", "bilinmeyen hata")
-                    return f"Şu an cevap veremiyorum, teknik sorun var: {hata[:200]}"
+                    return None
+                veri = await yanit.json()
                 adaylar = veri.get("candidates", [])
                 if not adaylar:
-                    return "Diyecek bir şey bulamadım."
+                    return None
                 parcalar = adaylar[0].get("content", {}).get("parts", [])
                 metin = "".join(p.get("text", "") for p in parcalar).strip()
-                return metin[:1900] if metin else "Diyecek bir şey bulamadım."
+                return metin or None
     except Exception:
-        return "Şu an cevap veremiyorum, bağlantı sorunu var."
+        return None
+
+
+async def _groq_dene(soru: str, baglam: str):
+    if not GROQ_API_KEY:
+        return None
+    gövde = {
+        "model": GROQ_MODEL,
+        "messages": [
+            {"role": "system", "content": AI_SISTEM_PROMPTU},
+            {"role": "user", "content": f"{baglam}\n\nSoru: {soru}"},
+        ],
+        "max_tokens": 300,
+    }
+    try:
+        async with aiohttp.ClientSession() as oturum:
+            async with oturum.post(
+                "https://api.groq.com/openai/v1/chat/completions", json=gövde,
+                headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+                timeout=aiohttp.ClientTimeout(total=20),
+            ) as yanit:
+                if yanit.status != 200:
+                    return None
+                veri = await yanit.json()
+                metin = veri["choices"][0]["message"]["content"].strip()
+                return metin or None
+    except Exception:
+        return None
+
+
+async def gemini_cevap(soru: str, baglam: str) -> str:
+    if not GEMINI_API_KEY and not GROQ_API_KEY:
+        return "Yapay zeka şu an kapalı (API anahtarı tanımlı değil)."
+    # Önce Gemini, olmazsa yedek olarak Groq
+    for deneme in (_gemini_dene, _groq_dene):
+        metin = await deneme(soru, baglam)
+        if metin:
+            return metin[:1900]
+    return "Şu an iki yapay zeka da cevap vermiyor (limit dolmuş ya da teknik sorun var), biraz sonra tekrar dene."
+
 
 # ---------- Otomod ayarları ----------
 KUFUR_MUTE_SURESI = 7 * 86400   # Küfür: 7 gün mute
@@ -134,6 +175,16 @@ FORMAT_METNI = """İstenilen rütbe:
 Ekstra istek:
 Tecrübeli olunan kamplar ve bu kamplarda rütbeleriniz:
 Tecrübe kanıt SS'leri:"""
+
+# !linkler komutuyla atılacak linkler
+LINKLER_METNI = (
+    "YK Studio Ana Roblox Grubu: https://www.roblox.com/share/g/277876846\n"
+    "Oyun linki: https://www.roblox.com/share?code=33ba1a0729622f4f8e8daa5a11cc427f"
+    "&type=ExperienceDetails&stamp=1792313936448"
+)
+
+# Yeni açılan kanalın adında bu kelimelerden biri geçiyorsa bot otomatik !format atar (ticket kanalları)
+TICKET_KANAL_ANAHTARLARI = ("ticket",)
 
 # Bot sunucuya eklenirken davet linki bu izinleri ister
 GEREKLI_IZINLER = discord.Permissions(
@@ -685,6 +736,9 @@ async def on_message(message: discord.Message):
     if message.content.strip().lower() == "!format":
         await message.channel.send(FORMAT_METNI)
         return
+    if message.content.strip().lower() == "!linkler":
+        await message.channel.send(LINKLER_METNI)
+        return
 
     # Mesaj botun etiketiyle BAŞLIYORSA yapay zeka cevap versin
     etiketler = (f"<@{bot.user.id}>", f"<@!{bot.user.id}>")
@@ -714,6 +768,20 @@ async def on_message(message: discord.Message):
             baglam = "Son konuşmalar:\n" + "\n".join(gecmis) if gecmis else ""
             cevap = await gemini_cevap(soru, baglam)
         await message.reply(cevap, mention_author=False)
+
+
+# 0b) Yeni açılan ticket kanalına otomatik !format metnini atar
+@bot.event
+async def on_guild_channel_create(kanal: discord.abc.GuildChannel):
+    if not isinstance(kanal, discord.TextChannel):
+        return
+    if not any(a in kanal.name.lower() for a in TICKET_KANAL_ANAHTARLARI):
+        return
+    await asyncio.sleep(3)  # Ticket botu kanalı kurup izinleri ayarlamayı bitirsin
+    try:
+        await kanal.send(FORMAT_METNI)
+    except discord.HTTPException:
+        pass  # Botun bu kanalı görme/yazma izni yoksa sessizce geç
 
 
 # 1) Yeni üye gelince: banlıysa engelle, değilse hoş geldin mesajı
@@ -755,13 +823,61 @@ async def davet(interaction: discord.Interaction, kullanim: int = 5, saat: int =
 
 # 3) /mesaj -> SADECE sunucu sahibi. Sunucudaki bir üyeye botun hesabından DM atar
 @bot.tree.command(name="mesaj", description="Sunucudaki bir üyeye bot hesabından özel mesaj gönderir (sadece sunucu sahibi)")
-@app_commands.describe(kisi="Mesajın gideceği kişi", metin="Mesaj")
+@app_commands.describe(metin="Mesaj", kisi="Mesajın gideceği kişi (herkes seçiliyse boş bırak)",
+                       herkes="Evet seçersen sunucudaki tüm üyelere (botlar hariç) gider")
+@app_commands.choices(herkes=[app_commands.Choice(name="Evet, herkese gönder", value=1)])
 @app_commands.guild_only()
-async def mesaj(interaction: discord.Interaction, kisi: discord.Member, metin: str):
+async def mesaj(interaction: discord.Interaction, metin: str, kisi: discord.Member = None,
+                herkes: app_commands.Choice[int] = None):
     if interaction.user.id != interaction.guild.owner_id:
         return await interaction.response.send_message(
             "`/mesaj` komutunu sadece **sunucu sahibi** kullanabilir.", ephemeral=True
         )
+    if herkes:
+        hedefler = [m for m in interaction.guild.members if not m.bot and m.id != interaction.user.id]
+        sure_dk = len(hedefler)  # her DM arası 1 dakika
+
+        class Onay(discord.ui.View):
+            def __init__(self):
+                super().__init__(timeout=60)
+
+            @discord.ui.button(label="Evet, herkese gönder", style=discord.ButtonStyle.danger)
+            async def evet(self, inter: discord.Interaction, button: discord.ui.Button):
+                if inter.user.id != interaction.guild.owner_id:
+                    return await inter.response.send_message("Bu buton sana ait değil.", ephemeral=True)
+                self.stop()
+                await inter.response.edit_message(
+                    content="Gönderim başladı. Her DM arasında 1 dakika var, bitince sana DM'den haber vereceğim.", view=None)
+                sahip = inter.user
+
+                async def gonder():
+                    basarili = kapali = 0
+                    for m in hedefler:
+                        try:
+                            await m.send(metin)
+                            basarili += 1
+                        except (discord.Forbidden, discord.HTTPException):
+                            kapali += 1
+                        await asyncio.sleep(60)  # DM'ler arası 1 dakika
+                    try:
+                        await sahip.send(
+                            f"Toplu mesaj bitti. Gönderilen: **{basarili}**, gönderilemeyen (DM kapalı vb.): **{kapali}**")
+                    except discord.HTTPException:
+                        pass
+
+                asyncio.create_task(gonder())
+
+            @discord.ui.button(label="İptal", style=discord.ButtonStyle.secondary)
+            async def iptal(self, inter: discord.Interaction, button: discord.ui.Button):
+                self.stop()
+                await inter.response.edit_message(content="İptal edildi.", view=None)
+
+        return await interaction.response.send_message(
+            f"**{len(hedefler)}** kişiye şu mesaj gidecek (yaklaşık {sure_dk} dk sürer):\n\n{metin}\n\nOnaylıyor musun?",
+            view=Onay(), ephemeral=True
+        )
+    if kisi is None:
+        return await interaction.response.send_message("Bir kişi seç ya da `herkes` seçeneğini kullan.", ephemeral=True)
     try:
         await kisi.send(metin)  # Mesaj botun hesabından, olduğu gibi gider
         await interaction.response.send_message(f"{kisi.display_name} kişisine mesaj gönderildi.", ephemeral=True)
