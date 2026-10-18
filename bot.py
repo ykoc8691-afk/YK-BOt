@@ -3,7 +3,6 @@ import re
 import asyncio
 import json
 import time
-import secrets
 import difflib
 import discord
 from discord import app_commands
@@ -1482,10 +1481,9 @@ async def normalmesaj(interaction: discord.Interaction):
     await ai_mod_ayarla(interaction, "normal", "Yapay zeka artık **normal** modda.")
 
 
-# ---------- Roblox grup bağlantısı (/bagla, /dogrula, /rutbe ...) ----------
+# ---------- Roblox grup bağlantısı (/rutbe; Roblox adı RoWifi takma adından okunur) ----------
 ROBLOX_API_KEY = os.getenv("ROBLOX_API_KEY")                 # Railway Variables'a eklenir, koda yazılmaz
 ROBLOX_GROUP_ID = os.getenv("ROBLOX_GROUP_ID", "277876846")  # YK Studio grubu
-ROBLOX_DOSYASI = "roblox.json"   # {"baglar": {discord_id: {...}}, "bekleyen": {...}, "eslesme": {discord_rol_id: roblox_rol_id}}
 _roblox_rol_onbellek = {"zaman": 0, "roller": []}
 
 
@@ -1515,11 +1513,6 @@ async def roblox_kullanici_bul(ad: str):
                                      json={"usernames": [ad], "excludeBannedUsers": True})
     liste = veri.get("data") if isinstance(veri, dict) else None
     return (liste[0]["id"], liste[0]["name"]) if liste else (None, None)
-
-
-async def roblox_aciklama(kullanici_id: int) -> str:
-    durum, veri = await roblox_istek("GET", f"https://users.roblox.com/v1/users/{kullanici_id}")
-    return (veri.get("description") or "") if isinstance(veri, dict) else ""
 
 
 async def roblox_roller(yenile: bool = False) -> list:
@@ -1562,49 +1555,20 @@ def _rol_id(r: dict) -> str:
     return str(r.get("id") or r.get("path", "").split("/")[-1])
 
 
-def roblox_kayit() -> dict:
-    v = json_yukle(ROBLOX_DOSYASI)
-    for k in ("baglar", "bekleyen", "eslesme"):
-        v.setdefault(k, {})
-    return v
+def nick_roblox_adi(uye: discord.Member) -> str:
+    """RoWifi takma adından Roblox kullanıcı adını çıkarır. Başındaki [RÜTBE], (..), {..} gibi etiketler sayılmaz."""
+    ad = uye.nick or uye.display_name or ""
+    while True:
+        yeni = re.sub(r"^\s*(?:\[[^\]]*\]|\([^)]*\)|\{[^}]*\}|<[^>]*>)\s*", "", ad)
+        if yeni == ad:
+            break
+        ad = yeni
+    ad = ad.strip()
+    return ad.split()[0] if ad else ""
 
 
 def rutbe_yetkilisi_mi(interaction: discord.Interaction) -> bool:
     return yap_yetkilisi_mi(interaction.user.id, interaction.guild) or interaction.user.guild_permissions.administrator
-
-
-@bot.tree.command(name="bagla", description="Roblox hesabını Discord hesabına bağlamaya başlar")
-@app_commands.describe(robloxadi="Roblox kullanıcı adın")
-async def bagla(interaction: discord.Interaction, robloxadi: str):
-    await interaction.response.defer(ephemeral=True)
-    rid, ad = await roblox_kullanici_bul(robloxadi)
-    if not rid:
-        return await interaction.followup.send("Bu adda bir Roblox hesabı bulamadım.", ephemeral=True)
-    kod = "YK-" + secrets.token_hex(3).upper()
-    kayit = roblox_kayit()
-    kayit["bekleyen"][str(interaction.user.id)] = {"id": rid, "ad": ad, "kod": kod, "zaman": int(time.time())}
-    json_kaydet(ROBLOX_DOSYASI, kayit)
-    await interaction.followup.send(
-        f"**{ad}** hesabını doğrulamak için Roblox profilinin **Hakkımda** kısmına şu kodu yaz:\n`{kod}`\n"
-        f"Kaydettikten sonra buraya `/dogrula` yaz (kod 30 dakika geçerli). Doğrulandıktan sonra kodu silebilirsin.",
-        ephemeral=True)
-
-
-@bot.tree.command(name="dogrula", description="/bagla ile aldığın kodu profilinde bulup hesabı bağlar")
-async def dogrula(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-    kayit = roblox_kayit()
-    bek = kayit["bekleyen"].get(str(interaction.user.id))
-    if not bek or time.time() - bek["zaman"] > 1800:
-        return await interaction.followup.send("Bekleyen doğrulama yok ya da süresi doldu. Önce `/bagla` yaz.", ephemeral=True)
-    aciklama = await roblox_aciklama(bek["id"])
-    if bek["kod"] not in aciklama:
-        return await interaction.followup.send(
-            "Profil açıklamanda kodu göremedim. Kaydettiğinden emin ol, Roblox'un güncellemesi 1-2 dakika sürebilir.", ephemeral=True)
-    kayit["baglar"][str(interaction.user.id)] = {"id": bek["id"], "ad": bek["ad"]}
-    kayit["bekleyen"].pop(str(interaction.user.id), None)
-    json_kaydet(ROBLOX_DOSYASI, kayit)
-    await interaction.followup.send(f"Hesabın bağlandı: **{bek['ad']}**", ephemeral=True)
 
 
 @bot.tree.command(name="robloxrutbeler", description="Roblox grubundaki rütbeleri listeler (yönetici)")
@@ -1746,10 +1710,13 @@ async def rutbe(interaction: discord.Interaction, kisi: discord.Member, roblox_r
         yakin = difflib.get_close_matches(roblox_rutbe, [r["displayName"] for r in roller], n=3, cutoff=0.5)
         ipucu = f" Şunu mu demek istedin: {', '.join(yakin)}?" if yakin else " `/robloxrutbeler` ile listeye bak."
         return await interaction.followup.send(f"Roblox grubunda **{roblox_rutbe}** adında rütbe yok.{ipucu}", ephemeral=True)
-    bag = roblox_kayit()["baglar"].get(str(kisi.id))
-    if not bag:
+    isim = nick_roblox_adi(kisi)
+    rid, rad = await roblox_kullanici_bul(isim) if isim else (None, None)
+    if not rid:
         return await interaction.followup.send(
-            f"{kisi.display_name} Roblox hesabını bağlamamış. Önce `/bagla` ve `/dogrula` yapmalı.", ephemeral=True)
+            f"{kisi.display_name} takma adından Roblox hesabını bulamadım (okunan ad: `{isim or '-'}`). "
+            f"Takma ad `[RÜTBE] RobloxAdı` ya da `RobloxAdı` biçiminde olmalı (RoWifi ile doğrulanmış olmalı).", ephemeral=True)
+    bag = {"id": rid, "ad": rad}
     # Discord'da aynı/benzer isimli rolü bul; yoksa hiçbir şeyi değiştirmeden dur (iki taraf ayrışmasın)
     discord_rol, tam = discord_rol_bul(interaction.guild, hedef["displayName"])
     if not discord_rol:
