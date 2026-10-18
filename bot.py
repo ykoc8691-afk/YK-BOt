@@ -31,30 +31,71 @@ AI_GECMIS_MESAJ = 4                           # Cevap verirken kaç önceki mesa
 AI_BEKLEME_SANIYE = 20                        # Aynı kişi art arda soruyu bu kadar saniyede bir sorabilir (kota koruma)
 ai_son_kullanim = {}                          # kullanıcı_id -> son AI kullanım zamanı
 AI_SISTEM_PROMPTU = (
-    "Sen bir Discord kampı sunucusunun botusun. Sert, agresif, sivri dilli ve sabırsız bir üslubun var; "
-    "yaltaklanmaz, uzun uzun özür dilemezsin, laf sokarsın. Ama KÜFÜR ETMEZSİN, hakaret/ırkçılık/cinsiyetçilik "
-    "yapmazsın, kimseyi gerçekten tehdit etmezsin ve yasa dışı hiçbir şeye yardım etmezsin — bunlar tartışmaya "
-    "kapalı sınırlar. Cevapların kısa ve Türkçe olsun, gereksiz uzatma."
+    "Sen bir Discord kampı sunucusunun botusun. Samimi, esprili, hafif makaracı ve laf atan ama sevimli bir "
+    "arkadaş gibisin; şakalaşır, takılırsın ama kırıcı olmazsın. ÖNEMLİ: Önce sana söyleneni yap veya soruyu net "
+    "cevapla, espriyi ikinci planda tut. Cevaplar kısa, doğal ve Türkçe olsun. Bilmediğin bir şeyi uydurma, "
+    "bilmiyorum de. KÜFÜR ETMEZSİN, hakaret/ırkçılık/cinsiyetçilik yapmazsın, kimseyi tehdit etmezsin ve yasa dışı "
+    "hiçbir şeye yardım etmezsin."
 )
+OGRENILEN_DOSYASI = "ogrenilenler.json"       # Bota öğretilen bilgiler (sunucu_id -> [bilgi, ...])
+MAKS_OGRENILEN = 100
+
+
+def ogrenilenleri_getir(guild_id: int) -> list:
+    return json_yukle(OGRENILEN_DOSYASI).get(str(guild_id), [])
+
+
+def ogrenilen_ekle(guild_id: int, bilgi: str) -> int:
+    veri = json_yukle(OGRENILEN_DOSYASI)
+    liste = veri.get(str(guild_id), [])
+    liste.append(bilgi[:500])
+    veri[str(guild_id)] = liste[-MAKS_OGRENILEN:]
+    json_kaydet(OGRENILEN_DOSYASI, veri)
+    return len(veri[str(guild_id)])
+
+
+def ai_sistem_prompt(guild_id: int) -> str:
+    bilgiler = ogrenilenleri_getir(guild_id)[-40:]
+    if not bilgiler:
+        return AI_SISTEM_PROMPTU
+    metin = "\n".join(f"- {b}" for b in bilgiler)[:4000]
+    return (AI_SISTEM_PROMPTU + "\n\nSana öğretilen bilgiler (doğru kabul et, ilgili soru gelirse bunları kullan):\n" + metin)
+
+
+def gecmis_ara(guild_id: int, soru: str, limit: int = 6) -> list:
+    """Sunucuda geçmişte yazılmış (mesaj kaydından) soruyla ilgili mesajları bulur."""
+    kelimeler = [k for k in re.findall(r"\w+", soru.lower()) if len(k) >= 4][:4]
+    if not kelimeler:
+        return []
+    kosul = " OR ".join("lower(icerik) LIKE ?" for _ in kelimeler)
+    satirlar = db.execute(
+        f"SELECT yazar_ad, icerik FROM mesajlar WHERE sunucu_id=? AND icerik != '' AND icerik NOT LIKE '<@%' "
+        f"AND ({kosul}) ORDER BY yazilma DESC LIMIT ?",
+        (guild_id, *[f"%{k}%" for k in kelimeler], limit),
+    ).fetchall()
+    return [f"{ad}: {ic[:200]}" for ad, ic in reversed(satirlar)]
 
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")      # Yedek ücretsiz yapay zeka (Gemini çalışmazsa devreye girer)
 GROQ_MODEL = "llama-3.3-70b-versatile"
 
 
-async def _gemini_dene(soru: str, baglam: str):
+async def _gemini_dene(sistem: str, kullanici: str, json_mod: bool, token: int):
     """Başarılıysa metin, başarısızsa None döner."""
     if not GEMINI_API_KEY:
         return None
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+    ayar = {"maxOutputTokens": token}
+    if json_mod:
+        ayar["responseMimeType"] = "application/json"
     gövde = {
-        "system_instruction": {"parts": [{"text": AI_SISTEM_PROMPTU}]},
-        "contents": [{"role": "user", "parts": [{"text": f"{baglam}\n\nSoru: {soru}"}]}],
-        "generationConfig": {"maxOutputTokens": 300},
+        "system_instruction": {"parts": [{"text": sistem}]},
+        "contents": [{"role": "user", "parts": [{"text": kullanici}]}],
+        "generationConfig": ayar,
     }
     try:
         async with aiohttp.ClientSession() as oturum:
-            async with oturum.post(url, json=gövde, timeout=aiohttp.ClientTimeout(total=20)) as yanit:
+            async with oturum.post(url, json=gövde, timeout=aiohttp.ClientTimeout(total=25)) as yanit:
                 if yanit.status != 200:
                     return None
                 veri = await yanit.json()
@@ -68,23 +109,25 @@ async def _gemini_dene(soru: str, baglam: str):
         return None
 
 
-async def _groq_dene(soru: str, baglam: str):
+async def _groq_dene(sistem: str, kullanici: str, json_mod: bool, token: int):
     if not GROQ_API_KEY:
         return None
     gövde = {
         "model": GROQ_MODEL,
         "messages": [
-            {"role": "system", "content": AI_SISTEM_PROMPTU},
-            {"role": "user", "content": f"{baglam}\n\nSoru: {soru}"},
+            {"role": "system", "content": sistem},
+            {"role": "user", "content": kullanici},
         ],
-        "max_tokens": 300,
+        "max_tokens": token,
     }
+    if json_mod:
+        gövde["response_format"] = {"type": "json_object"}
     try:
         async with aiohttp.ClientSession() as oturum:
             async with oturum.post(
                 "https://api.groq.com/openai/v1/chat/completions", json=gövde,
                 headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-                timeout=aiohttp.ClientTimeout(total=20),
+                timeout=aiohttp.ClientTimeout(total=25),
             ) as yanit:
                 if yanit.status != 200:
                     return None
@@ -95,15 +138,179 @@ async def _groq_dene(soru: str, baglam: str):
         return None
 
 
-async def gemini_cevap(soru: str, baglam: str) -> str:
+async def ai_calistir(sistem: str, kullanici: str, json_mod: bool = False, token: int = 300):
+    """Önce Gemini, olmazsa Groq. İkisi de olmazsa None."""
+    for deneme in (_gemini_dene, _groq_dene):
+        metin = await deneme(sistem, kullanici, json_mod, token)
+        if metin:
+            return metin
+    return None
+
+
+async def gemini_cevap(soru: str, baglam: str, sistem: str = None) -> str:
     if not GEMINI_API_KEY and not GROQ_API_KEY:
         return "Yapay zeka şu an kapalı (API anahtarı tanımlı değil)."
-    # Önce Gemini, olmazsa yedek olarak Groq
-    for deneme in (_gemini_dene, _groq_dene):
-        metin = await deneme(soru, baglam)
-        if metin:
-            return metin[:1900]
+    metin = await ai_calistir(sistem or AI_SISTEM_PROMPTU, f"{baglam}\n\nSoru: {soru}")
+    if metin:
+        return metin[:1900]
     return "Şu an iki yapay zeka da cevap vermiyor (limit dolmuş ya da teknik sorun var), biraz sonra tekrar dene."
+
+
+# ---------- Yapay zekayla sunucu yönetimi (/yap veya "@bot yap: ...") ----------
+YAP_SISTEM = (
+    "Sen bir Discord sunucu yönetim asistanısın. Kullanıcının isteğini aşağıdaki işlemlere çevir ve SADECE JSON döndür: "
+    '{"islemler":[...], "not":"anlamadığın veya yapılamayan şeyler için kısa açıklama (yoksa boş)"}.\n'
+    "İşlemler:\n"
+    '- {"islem":"kanal_izin","kanal":<kanal id>,"rol":<rol id>,"izin":"gorsun"|"gormesin"|"yazsin"|"yazmasin"|"sifirla"}\n'
+    '- {"islem":"rol_olustur","ad":"...","renk":"#RRGGBB"}  (renk opsiyonel)\n'
+    '- {"islem":"rol_ver","kisi":<kullanıcı id>,"rol":<rol id>}\n'
+    '- {"islem":"rol_al","kisi":<kullanıcı id>,"rol":<rol id>}\n'
+    '- {"islem":"kanal_olustur","ad":"...","tur":"yazi"|"ses","kategori":<kategori id veya null>}\n'
+    '- {"islem":"kanal_adi","kanal":<kanal id>,"yeni_ad":"..."}\n'
+    "Rol ve kanal için verilen listedeki id'leri kullan, kullanıcılar istekte <@id> olarak geçer. "
+    "'Herkes' demek @everyone rolüdür. Listede olmayan bir şey istenirse işlem ekleme, not'a yaz. "
+    "Silme işlemleri ve yönetici izni verme DESTEKLENMİYOR; istenirse not'a yaz."
+)
+
+
+async def yap_hazirla(guild: discord.Guild, istek: str):
+    """İsteği işlem listesine çevirir. (islemler, not) döner; yapay zeka cevap vermezse (None, hata)."""
+    roller = "; ".join(f"{r.name}={r.id}" for r in guild.roles[:100])
+    kanallar = "; ".join(f"{k.name} [{k.type.name}]={k.id}" for k in guild.channels[:150])
+    metin = await ai_calistir(YAP_SISTEM, f"Roller: {roller}\nKanallar: {kanallar}\n\nİstek: {istek}",
+                              json_mod=True, token=1000)
+    if not metin:
+        return None, "Yapay zeka şu an cevap vermiyor, biraz sonra tekrar dene."
+    try:
+        metin = re.sub(r"^```(?:json)?|```$", "", metin.strip(), flags=re.M).strip()
+        veri = json.loads(metin)
+        return [i for i in veri.get("islemler", []) if isinstance(i, dict)][:10], str(veri.get("not", "") or "")
+    except (json.JSONDecodeError, AttributeError):
+        return None, "İsteği anlayamadım, daha net yazar mısın?"
+
+
+def _id_ad(guild: discord.Guild, tur: str, deger):
+    try:
+        i = int(deger)
+    except (TypeError, ValueError):
+        return None
+    return {"kanal": guild.get_channel, "rol": guild.get_role, "kisi": guild.get_member}[tur](i)
+
+
+def yap_tanim(guild: discord.Guild, i: dict) -> str:
+    t = i.get("islem")
+    kanal, rol, kisi = _id_ad(guild, "kanal", i.get("kanal")), _id_ad(guild, "rol", i.get("rol")), _id_ad(guild, "kisi", i.get("kisi"))
+    izinler = {"gorsun": "görsün", "gormesin": "görmesin", "yazsin": "yazabilsin", "yazmasin": "yazamasın", "sifirla": "izni sıfırlansın"}
+    if t == "kanal_izin":
+        return f"**{rol.name if rol else '?'}** rolü **#{kanal.name if kanal else '?'}** kanalında: {izinler.get(i.get('izin'), '?')}"
+    if t == "rol_olustur":
+        return f"**{i.get('ad')}** adında rol oluştur"
+    if t in ("rol_ver", "rol_al"):
+        return f"**{kisi.display_name if kisi else '?'}** kişisine **{rol.name if rol else '?'}** rolünü {'ver' if t == 'rol_ver' else 'al'}"
+    if t == "kanal_olustur":
+        return f"**{i.get('ad')}** adında {'ses' if i.get('tur') == 'ses' else 'yazı'} kanalı oluştur"
+    if t == "kanal_adi":
+        return f"**#{kanal.name if kanal else '?'}** kanalının adını **{i.get('yeni_ad')}** yap"
+    return f"Desteklenmeyen işlem: {t}"
+
+
+async def yap_uygula(guild: discord.Guild, i: dict, yapan: str) -> str:
+    t = i.get("islem")
+    sebep = f"Bot yönetimi: {yapan}"
+    tanim = yap_tanim(guild, i)
+    kanal, rol, kisi = _id_ad(guild, "kanal", i.get("kanal")), _id_ad(guild, "rol", i.get("rol")), _id_ad(guild, "kisi", i.get("kisi"))
+    try:
+        if t == "kanal_izin":
+            if not kanal or not rol:
+                return f"❌ {tanim} (kanal veya rol bulunamadı)"
+            izin = i.get("izin")
+            if izin == "sifirla":
+                await kanal.set_permissions(rol, overwrite=None, reason=sebep)
+            else:
+                ow = kanal.overwrites_for(rol)
+                if izin == "gorsun":
+                    ow.view_channel = True
+                elif izin == "gormesin":
+                    ow.view_channel = False
+                elif izin == "yazsin":
+                    ow.send_messages = True
+                elif izin == "yazmasin":
+                    ow.send_messages = False
+                else:
+                    return f"❌ {tanim} (bilinmeyen izin)"
+                await kanal.set_permissions(rol, overwrite=ow, reason=sebep)
+        elif t == "rol_olustur":
+            renk = discord.Color.default()
+            m = re.fullmatch(r"#?([0-9a-fA-F]{6})", str(i.get("renk") or ""))
+            if m:
+                renk = discord.Color(int(m.group(1), 16))
+            await guild.create_role(name=str(i.get("ad"))[:100], color=renk, reason=sebep)
+        elif t in ("rol_ver", "rol_al"):
+            if not kisi or not rol:
+                return f"❌ {tanim} (kişi veya rol bulunamadı)"
+            if rol.permissions.administrator:
+                return f"❌ {tanim} (yönetici yetkili roller bot üzerinden verilip alınmaz)"
+            if t == "rol_ver":
+                await kisi.add_roles(rol, reason=sebep)
+            else:
+                await kisi.remove_roles(rol, reason=sebep)
+        elif t == "kanal_olustur":
+            kategori = _id_ad(guild, "kanal", i.get("kategori"))
+            kategori = kategori if isinstance(kategori, discord.CategoryChannel) else None
+            ad = str(i.get("ad"))[:100]
+            if i.get("tur") == "ses":
+                await guild.create_voice_channel(ad, category=kategori, reason=sebep)
+            else:
+                await guild.create_text_channel(ad, category=kategori, reason=sebep)
+        elif t == "kanal_adi":
+            if not kanal:
+                return f"❌ {tanim} (kanal bulunamadı)"
+            await kanal.edit(name=str(i.get("yeni_ad"))[:100], reason=sebep)
+        else:
+            return f"❌ {tanim}"
+    except discord.Forbidden:
+        return f"❌ {tanim} (botun yetkisi yetmedi; bot rolü hedef rolün/kanalın üstünde olmalı)"
+    except discord.HTTPException as e:
+        return f"❌ {tanim} (Discord hatası: {e.text[:80]})"
+    return f"✅ {tanim}"
+
+
+class YapOnay(discord.ui.View):
+    def __init__(self, guild: discord.Guild, islemler: list, yetkililer: set):
+        super().__init__(timeout=180)
+        self.guild, self.islemler, self.yetkililer = guild, islemler, yetkililer
+
+    @discord.ui.button(label="Onayla", style=discord.ButtonStyle.success)
+    async def onayla(self, inter: discord.Interaction, button: discord.ui.Button):
+        if inter.user.id not in self.yetkililer:
+            return await inter.response.send_message("Bu buton sana ait değil.", ephemeral=True)
+        self.stop()
+        await inter.response.edit_message(content="Uygulanıyor...", view=None)
+        sonuc = [await yap_uygula(self.guild, i, str(inter.user)) for i in self.islemler]
+        await inter.edit_original_response(content="\n".join(sonuc)[:1900])
+
+    @discord.ui.button(label="İptal", style=discord.ButtonStyle.secondary)
+    async def iptal(self, inter: discord.Interaction, button: discord.ui.Button):
+        if inter.user.id not in self.yetkililer:
+            return await inter.response.send_message("Bu buton sana ait değil.", ephemeral=True)
+        self.stop()
+        await inter.response.edit_message(content="İptal edildi.", view=None)
+
+
+def yap_yetkilisi_mi(kullanici_id: int, guild: discord.Guild) -> bool:
+    return kullanici_id in (OWNER_KULLANICI_ID, guild.owner_id)
+
+
+async def yap_metni_ve_gorunum(guild: discord.Guild, istek: str):
+    """(mesaj metni, view veya None) döner."""
+    islemler, not_ = await yap_hazirla(guild, istek)
+    if islemler is None:
+        return not_, None
+    if not islemler:
+        return "Yapılacak bir işlem çıkaramadım." + (f"\nNot: {not_}" if not_ else ""), None
+    satirlar = "\n".join(f"{n}. {yap_tanim(guild, i)}" for n, i in enumerate(islemler, 1))
+    metin = f"Şunları yapacağım:\n{satirlar}\n" + (f"\nNot: {not_}\n" if not_ else "") + "\nOnaylıyor musun?"
+    return metin[:1900], YapOnay(guild, islemler, {OWNER_KULLANICI_ID, guild.owner_id})
 
 
 # ---------- Otomod ayarları ----------
@@ -197,6 +404,8 @@ GEREKLI_IZINLER = discord.Permissions(
     ban_members=True,           # /ban, /databan, /unban ve otomod banı için
     moderate_members=True,      # /mute ve otomod susturması için
     mention_everyone=True,      # Otomod uyarılarında @here etiketi için
+    manage_roles=True,          # /yap ile rol verme/oluşturma için
+    manage_channels=True,       # /yap ile kanal izni/oluşturma için
 )
 
 
@@ -750,6 +959,19 @@ async def on_message(message: discord.Message):
         soru = soru.strip()
         if not soru:
             return
+        # "@bot öğren: ..." -> sadece sahip/yöneticiler bota bilgi öğretebilir
+        ogren_m = re.match(r"(?is)^(?:öğren|ogren|ezberle)(?:\s*:\s*|\s+)(.+)$", soru)
+        if ogren_m and (message.author.id == OWNER_KULLANICI_ID or message.author.guild_permissions.administrator):
+            adet = ogrenilen_ekle(message.guild.id, ogren_m.group(1).strip())
+            await message.reply(f"Tamam, ezberledim. (Toplam {adet} bilgi biliyorum)", mention_author=False)
+            return
+        # "@bot yap: ..." -> sadece sunucu sahibi / bot sahibi sunucuda işlem yaptırabilir
+        yap_m = re.match(r"(?is)^yap\s*:\s*(.+)$", soru)
+        if yap_m and yap_yetkilisi_mi(message.author.id, message.guild):
+            async with message.channel.typing():
+                metin, gorunum = await yap_metni_ve_gorunum(message.guild, yap_m.group(1).strip())
+            await message.reply(metin, view=gorunum, mention_author=False)
+            return
         # Kota koruma: aynı kişi çok sık sorarsa API'ye gitmeden ⏳ ile işaretle
         simdi = time.time()
         if simdi - ai_son_kullanim.get(message.author.id, 0) < AI_BEKLEME_SANIYE:
@@ -766,7 +988,10 @@ async def on_message(message: discord.Message):
                     gecmis.append(f"{onceki.author.display_name}: {onceki.content}")
             gecmis.reverse()
             baglam = "Son konuşmalar:\n" + "\n".join(gecmis) if gecmis else ""
-            cevap = await gemini_cevap(soru, baglam)
+            ilgili = gecmis_ara(message.guild.id, soru)
+            if ilgili:
+                baglam += "\n\nSunucuda geçmişte yazılmış ilgili mesajlar:\n" + "\n".join(ilgili)
+            cevap = await gemini_cevap(soru, baglam, ai_sistem_prompt(message.guild.id))
         await message.reply(cevap, mention_author=False)
 
 
@@ -883,6 +1108,49 @@ async def mesaj(interaction: discord.Interaction, metin: str, kisi: discord.Memb
         await interaction.response.send_message(f"{kisi.display_name} kişisine mesaj gönderildi.", ephemeral=True)
     except discord.Forbidden:
         await interaction.response.send_message("Bu kişinin DM'leri kapalı.", ephemeral=True)
+
+
+# 4b) /ogrendiklerim, /unut, /yap -> yapay zeka bilgi ve yönetim komutları
+@bot.tree.command(name="ogrendiklerim", description="Bota öğretilen bilgileri listeler (yönetici)")
+@app_commands.default_permissions(administrator=True)
+@app_commands.guild_only()
+async def ogrendiklerim(interaction: discord.Interaction):
+    bilgiler = ogrenilenleri_getir(interaction.guild.id)
+    if not bilgiler:
+        return await interaction.response.send_message(
+            "Henüz bir şey öğretilmedi. Bota `@bot öğren: ...` yazarak öğretebilirsin.", ephemeral=True)
+    metin = "\n".join(f"{n}. {b[:150]}" for n, b in enumerate(bilgiler, 1))
+    await interaction.response.send_message(metin[:1900], ephemeral=True)
+
+
+@bot.tree.command(name="unut", description="Bota öğretilen bir bilgiyi siler (yönetici)")
+@app_commands.describe(numara="/ogrendiklerim listesindeki numara")
+@app_commands.default_permissions(administrator=True)
+@app_commands.guild_only()
+async def unut(interaction: discord.Interaction, numara: int):
+    veri = json_yukle(OGRENILEN_DOSYASI)
+    liste = veri.get(str(interaction.guild.id), [])
+    if not 1 <= numara <= len(liste):
+        return await interaction.response.send_message("Böyle bir numara yok.", ephemeral=True)
+    silinen = liste.pop(numara - 1)
+    veri[str(interaction.guild.id)] = liste
+    json_kaydet(OGRENILEN_DOSYASI, veri)
+    await interaction.response.send_message(f"Unuttum: {silinen[:150]}", ephemeral=True)
+
+
+@bot.tree.command(name="yap", description="Yapay zekaya sunucuda iş yaptır (sadece sunucu sahibi)")
+@app_commands.describe(istek="Örn: Üye rolü #duyurular kanalını görsün ama yazamasın")
+@app_commands.guild_only()
+async def yap(interaction: discord.Interaction, istek: str):
+    if not yap_yetkilisi_mi(interaction.user.id, interaction.guild):
+        return await interaction.response.send_message("Bu komutu sadece sunucu sahibi kullanabilir.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    metin, gorunum = await yap_metni_ve_gorunum(interaction.guild, istek)
+    if gorunum:
+        await interaction.followup.send(metin, view=gorunum, ephemeral=True)
+    else:
+        await interaction.followup.send(metin, ephemeral=True)
+
 
 
 # 4) /duyuru -> sadece yöneticiler, bulunduğu kanala embed duyuru atar
