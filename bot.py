@@ -4,6 +4,7 @@ import asyncio
 import json
 import time
 import secrets
+import difflib
 import discord
 from discord import app_commands
 import sqlite3
@@ -1630,27 +1631,6 @@ async def _rutbe_oto(interaction: discord.Interaction, current: str):
             for r in roller if current.lower() in r.get("displayName", "").lower()][:25]
 
 
-@bot.tree.command(name="rutbeeslestir", description="Bir Discord rolünü bir Roblox grup rütbesiyle eşleştirir (yönetici)")
-@app_commands.describe(discord_rol="Discord rolü", roblox_rutbe="Roblox grubundaki rütbe adı")
-@app_commands.autocomplete(roblox_rutbe=_rutbe_oto)
-@app_commands.default_permissions(administrator=True)
-@app_commands.guild_only()
-async def rutbeeslestir(interaction: discord.Interaction, discord_rol: discord.Role, roblox_rutbe: str):
-    if not rutbe_yetkilisi_mi(interaction):
-        return await interaction.response.send_message("Yetkin yok.", ephemeral=True)
-    await interaction.response.defer(ephemeral=True)
-    roller = await roblox_roller(yenile=True)
-    r = _rol_bul(roller, roblox_rutbe)
-    if not r:
-        return await interaction.followup.send("Bu adda bir Roblox rütbesi bulamadım. `/robloxrutbeler` ile listeye bak.", ephemeral=True)
-    if r.get("rank", 0) >= 255 or r.get("rank", 0) == 0:
-        return await interaction.followup.send("Grup sahibi ve ziyaretçi (0) rütbesi eşleştirilemez.", ephemeral=True)
-    kayit = roblox_kayit()
-    kayit["eslesme"][str(discord_rol.id)] = _rol_id(r)
-    json_kaydet(ROBLOX_DOSYASI, kayit)
-    await interaction.followup.send(f"{discord_rol.mention} ⇄ Roblox **{r['displayName']}** eşleştirildi.", ephemeral=True)
-
-
 @bot.tree.command(name="rutbelogkanal", description="Rütbe verme işlemlerinin loglanacağı kanalı seçer (yönetici)")
 @app_commands.default_permissions(administrator=True)
 @app_commands.guild_only()
@@ -1661,59 +1641,128 @@ async def rutbelogkanal(interaction: discord.Interaction, kanal: discord.TextCha
     await interaction.response.send_message(f"Rütbe logları {kanal.mention} kanalına yazılacak.", ephemeral=True)
 
 
-@bot.tree.command(name="rutbe", description="Üyeye hem Roblox grubunda hem Discord'da rütbe verir (yetkili)")
-@app_commands.describe(kisi="Rütbe verilecek üye", discord_rol="Verilecek rütbe (eşleştirilmiş Discord rolü)")
+_AD_HARITA = str.maketrans("ışçğöü", "iscgou")
+
+
+def _ad_norm(ad: str) -> str:
+    """Rol/rütbe adı karşılaştırması için: küçük harf, Türkçe harfler ASCII, '-' ve '_' boşluk. '+' korunur (A ile A+ karışmasın)."""
+    ad = ad.replace("İ", "i").lower().translate(_AD_HARITA)
+    ad = re.sub(r"[-_]+", " ", ad)
+    ad = re.sub(r"[^a-z0-9+ ]", "", ad)
+    return " ".join(ad.split())
+
+
+def discord_rol_bul(guild: discord.Guild, ad: str):
+    """Roblox rütbe adına en uygun Discord rolünü bulur. (rol, tam_eslesme_mi) döner; yoksa (None, False).
+    Yönetici yetkili ve bot/entegrasyon rolleri hiç seçilmez."""
+    adaylar = [r for r in guild.roles if r.id != guild.id and not r.managed and not r.permissions.administrator]
+    n = _ad_norm(ad)
+    if not n:
+        return None, False
+    tam = [r for r in adaylar if _ad_norm(r.name) == n]
+    if tam:
+        return tam[0], True
+    icerir = [r for r in adaylar if n in _ad_norm(r.name) or _ad_norm(r.name) in n and _ad_norm(r.name)]
+    if len(icerir) == 1:
+        return icerir[0], False
+    harita = {_ad_norm(r.name): r for r in adaylar}
+    yakin = difflib.get_close_matches(n, list(harita), n=1, cutoff=0.75)
+    return (harita[yakin[0]], False) if yakin else (None, False)
+
+
+async def rutbe_isle(guild: discord.Guild, kisi: discord.Member, hedef: dict, discord_rol: discord.Role,
+                     yapan: discord.abc.User, bag: dict) -> list:
+    """Önce Roblox rütbesini verir; sadece o başarılıysa Discord rolünü verir. Sonuç satırlarını döner."""
+    if hedef.get("rank", 0) >= 255 or hedef.get("rank", 0) == 0:
+        return ["❌ Grup sahibi ve ziyaretçi (0) rütbeleri bot ile verilmez."]
+    uyelik = await roblox_uyelik_bul(bag["id"])
+    if not uyelik:
+        return [f"❌ **{bag['ad']}** Roblox grubunda değil. Önce gruba katılmalı."]
+    roller = await roblox_roller()
+    mevcut = next((r for r in roller if r.get("path") == uyelik.get("role")), None)
+    if mevcut and mevcut.get("rank", 0) >= 255:
+        return ["❌ Grup sahibinin rütbesi değiştirilemez."]
+    durum, veri = await roblox_istek("PATCH", f"https://apis.roblox.com/cloud/v2/{uyelik['path']}",
+                                     json={"role": f"groups/{ROBLOX_GROUP_ID}/roles/{_rol_id(hedef)}"})
+    if durum != 200:
+        return [f"❌ Roblox rütbesi değişmedi (hata {durum}). Anahtarın izinlerini ve bot hesabının rütbesini kontrol et; "
+                f"bot hesabı verilecek rütbenin üstünde olmalı."]
+    satirlar = [f"✅ Roblox: **{bag['ad']}** → **{hedef['displayName']}**"]
+    try:
+        await kisi.add_roles(discord_rol, reason=f"/rutbe: {yapan}")
+        satirlar.append(f"✅ Discord: {discord_rol.mention} verildi")
+    except discord.Forbidden:
+        satirlar.append("❌ Discord rolü verilemedi (bot rolü bu rolün üstünde olmalı). Roblox rütbesi verildi, rolü elle ver.")
+    kid = json_yukle(AYAR_DOSYASI).get(str(guild.id), {}).get("rutbe_log_kanal")
+    kanal = guild.get_channel(kid) if kid else None
+    if kanal:
+        try:
+            await kanal.send(f"🎖️ {yapan.mention} → {kisi.mention} (Roblox: {bag['ad']}): **{hedef['displayName']}** / {discord_rol.mention}",
+                             allowed_mentions=discord.AllowedMentions.none())
+        except discord.HTTPException:
+            pass
+    return satirlar
+
+
+class RutbeOnay(discord.ui.View):
+    """Discord'da tam eşleşme yoksa, benzer rolü onaya sunar."""
+    def __init__(self, yapan_id, guild, kisi, hedef, discord_rol, bag):
+        super().__init__(timeout=120)
+        self.yapan_id, self.guild, self.kisi, self.hedef, self.discord_rol, self.bag = yapan_id, guild, kisi, hedef, discord_rol, bag
+
+    @discord.ui.button(label="Evet, bu rolü ver", style=discord.ButtonStyle.success)
+    async def evet(self, inter: discord.Interaction, button: discord.ui.Button):
+        if inter.user.id != self.yapan_id:
+            return await inter.response.send_message("Bu buton sana ait değil.", ephemeral=True)
+        self.stop()
+        await inter.response.edit_message(content="Uygulanıyor...", view=None)
+        satirlar = await rutbe_isle(self.guild, self.kisi, self.hedef, self.discord_rol, inter.user, self.bag)
+        await inter.edit_original_response(content="\n".join(satirlar)[:1900])
+
+    @discord.ui.button(label="İptal", style=discord.ButtonStyle.secondary)
+    async def iptal(self, inter: discord.Interaction, button: discord.ui.Button):
+        if inter.user.id != self.yapan_id:
+            return await inter.response.send_message("Bu buton sana ait değil.", ephemeral=True)
+        self.stop()
+        await inter.response.edit_message(content="İptal edildi, hiçbir şey değişmedi.", view=None)
+
+
+@bot.tree.command(name="rutbe", description="Üyeye Roblox grubunda rütbe verir, Discord'da aynı/benzer isimli rolü de verir (yetkili)")
+@app_commands.describe(kisi="Rütbe verilecek üye", roblox_rutbe="Roblox grubundaki rütbe adı")
+@app_commands.autocomplete(roblox_rutbe=_rutbe_oto)
 @app_commands.default_permissions(administrator=True)
 @app_commands.guild_only()
-async def rutbe(interaction: discord.Interaction, kisi: discord.Member, discord_rol: discord.Role):
+async def rutbe(interaction: discord.Interaction, kisi: discord.Member, roblox_rutbe: str):
     if not rutbe_yetkilisi_mi(interaction):
         return await interaction.response.send_message("Bu komutu kullanma yetkin yok.", ephemeral=True)
     if not ROBLOX_API_KEY:
         return await interaction.response.send_message("`ROBLOX_API_KEY` tanımlı değil.", ephemeral=True)
     await interaction.response.defer(ephemeral=True)
-    kayit = roblox_kayit()
-    hedef_rol_id = kayit["eslesme"].get(str(discord_rol.id))
-    if not hedef_rol_id:
-        return await interaction.followup.send(f"{discord_rol.mention} için Roblox eşleşmesi yok. Önce `/rutbeeslestir` yap.", ephemeral=True)
-    bag = kayit["baglar"].get(str(kisi.id))
-    if not bag:
-        return await interaction.followup.send(f"{kisi.display_name} Roblox hesabını bağlamamış. Önce `/bagla` ve `/dogrula` yapmalı.", ephemeral=True)
     roller = await roblox_roller(yenile=True)
-    hedef = next((r for r in roller if _rol_id(r) == str(hedef_rol_id)), None)
-    if not hedef or hedef.get("rank", 0) >= 255:
-        return await interaction.followup.send("Eşleşen Roblox rütbesi bulunamadı ya da grup sahibi rütbesi.", ephemeral=True)
-    uyelik = await roblox_uyelik_bul(bag["id"])
-    if not uyelik:
-        return await interaction.followup.send(f"**{bag['ad']}** Roblox grubunda değil. Önce gruba katılmalı.", ephemeral=True)
-    mevcut = next((r for r in roller if r.get("path") == uyelik.get("role")), None)
-    if mevcut and mevcut.get("rank", 0) >= 255:
-        return await interaction.followup.send("Grup sahibinin rütbesi değiştirilemez.", ephemeral=True)
-
-    satirlar = []
-    durum, veri = await roblox_istek("PATCH", f"https://apis.roblox.com/cloud/v2/{uyelik['path']}",
-                                     json={"role": f"groups/{ROBLOX_GROUP_ID}/roles/{hedef_rol_id}"})
-    if durum == 200:
-        satirlar.append(f"✅ Roblox: **{bag['ad']}** → **{hedef['displayName']}**")
-        roblox_tamam = True
-    else:
-        roblox_tamam = False
-        satirlar.append(f"❌ Roblox rütbesi değişmedi (hata {durum}). Anahtarın izinlerini ve botun hesabının rütbesini kontrol et; "
-                        f"bot hesabı verilecek rütbenin üstünde olmalı.")
-    if roblox_tamam:  # Roblox başarısızsa Discord rolü de verilmez, iki taraf ayrışmasın
-        try:
-            await kisi.add_roles(discord_rol, reason=f"/rutbe: {interaction.user}")
-            satirlar.append(f"✅ Discord: {discord_rol.mention} verildi")
-        except discord.Forbidden:
-            satirlar.append("❌ Discord rolü verilemedi (bot rolü bu rolün üstünde olmalı). Roblox rütbesi verildi, rolü elle ver.")
-    await interaction.followup.send("\n".join(satirlar), ephemeral=True)
-    if roblox_tamam:
-        kid = json_yukle(AYAR_DOSYASI).get(str(interaction.guild.id), {}).get("rutbe_log_kanal")
-        kanal = interaction.guild.get_channel(kid) if kid else None
-        if kanal:
-            try:
-                await kanal.send(f"🎖️ {interaction.user.mention} → {kisi.mention} (Roblox: {bag['ad']}): **{hedef['displayName']}**")
-            except discord.HTTPException:
-                pass
+    if not roller:
+        return await interaction.followup.send("Roblox rütbelerini alamadım. Anahtarı ve grup numarasını kontrol et.", ephemeral=True)
+    hedef = next((r for r in roller if _ad_norm(r.get("displayName", "")) == _ad_norm(roblox_rutbe)), None)
+    if not hedef:
+        yakin = difflib.get_close_matches(roblox_rutbe, [r["displayName"] for r in roller], n=3, cutoff=0.5)
+        ipucu = f" Şunu mu demek istedin: {', '.join(yakin)}?" if yakin else " `/robloxrutbeler` ile listeye bak."
+        return await interaction.followup.send(f"Roblox grubunda **{roblox_rutbe}** adında rütbe yok.{ipucu}", ephemeral=True)
+    bag = roblox_kayit()["baglar"].get(str(kisi.id))
+    if not bag:
+        return await interaction.followup.send(
+            f"{kisi.display_name} Roblox hesabını bağlamamış. Önce `/bagla` ve `/dogrula` yapmalı.", ephemeral=True)
+    # Discord'da aynı/benzer isimli rolü bul; yoksa hiçbir şeyi değiştirmeden dur (iki taraf ayrışmasın)
+    discord_rol, tam = discord_rol_bul(interaction.guild, hedef["displayName"])
+    if not discord_rol:
+        return await interaction.followup.send(
+            f"Discord'da **{hedef['displayName']}** adına benzer bir rol bulamadım. Rolü oluştur ya da adını eşitle, "
+            f"hiçbir şey değiştirmedim.", ephemeral=True)
+    if tam:
+        satirlar = await rutbe_isle(interaction.guild, kisi, hedef, discord_rol, interaction.user, bag)
+        return await interaction.followup.send("\n".join(satirlar)[:1900], ephemeral=True)
+    await interaction.followup.send(
+        f"Discord'da tam aynı isimli rol yok. En yakın rol: {discord_rol.mention}\n"
+        f"Roblox'ta **{hedef['displayName']}** rütbesi, Discord'da {discord_rol.mention} rolü verilsin mi?",
+        view=RutbeOnay(interaction.user.id, interaction.guild, kisi, hedef, discord_rol, bag), ephemeral=True)
 
 
 # 4) /duyuru -> sadece yöneticiler, bulunduğu kanala embed duyuru atar
