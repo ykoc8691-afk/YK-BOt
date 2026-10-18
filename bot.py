@@ -180,9 +180,12 @@ YAP_SISTEM = (
     '- {"islem":"rol_al","kisi":<kullanıcı id>,"rol":<rol id>}\n'
     '- {"islem":"kanal_olustur","ad":"...","tur":"yazi"|"ses","kategori":<kategori id veya null>}\n'
     '- {"islem":"kanal_adi","kanal":<kanal id>,"yeni_ad":"..."}\n'
+    '- {"islem":"izin_sorgu","kanal":<kanal id>,"rol":<rol id veya null>,"kisi":<kullanıcı id veya null>}  '
+    '(sadece soru: "X şu kanalı görebiliyor mu / yazabiliyor mu?" gibi; hiçbir şeyi değiştirmez)\n'
     "Rol ve kanal için verilen listedeki id'leri kullan, kullanıcılar istekte <@id> olarak geçer. "
     "'Herkes' demek @everyone rolüdür. Listede olmayan bir şey istenirse işlem ekleme, not'a yaz. "
-    "Silme işlemleri ve yönetici izni verme DESTEKLENMİYOR; istenirse not'a yaz."
+    "Silme işlemleri ve yönetici izni verme DESTEKLENMİYOR; istenirse not'a yaz. "
+    "Mesaj sunucu yönetimiyle ilgili bir istek DEĞİLSE (sohbet, soru, espri vb.) islemler boş liste ve not boş olsun."
 )
 
 
@@ -288,6 +291,32 @@ async def yap_uygula(guild: discord.Guild, i: dict, yapan: str) -> str:
     return f"✅ {tanim}"
 
 
+def izin_sorgu_cevabi(guild: discord.Guild, i: dict) -> str:
+    kanal = _id_ad(guild, "kanal", i.get("kanal"))
+    rol = _id_ad(guild, "rol", i.get("rol"))
+    kisi = _id_ad(guild, "kisi", i.get("kisi"))
+    if not kanal or not (rol or kisi):
+        return "❓ Kanal veya rol/kişi bulunamadı."
+    hedef = kisi if kisi else rol
+    p = kanal.permissions_for(hedef)
+    ad = kisi.display_name if kisi else rol.name
+    if p.administrator:
+        return f"**{ad}** yönetici yetkisine sahip, **#{kanal.name}** dahil her kanalı görür ve yazabilir."
+    gor = "görebilir ✅" if p.view_channel else "göremez ❌"
+    if isinstance(kanal, discord.VoiceChannel):
+        yaz = "bağlanabilir ✅" if p.connect else "bağlanamaz ❌"
+    else:
+        yaz = "yazabilir ✅" if p.send_messages else "yazamaz ❌"
+    return f"**{ad}** → **#{kanal.name}**: {gor}, {yaz}"
+
+
+def sorgu_ayir(guild: discord.Guild, islemler: list):
+    """(sorgu cevapları, değişiklik işlemleri) döner. Sorgular onay istemeden hemen cevaplanır."""
+    sorgular = [izin_sorgu_cevabi(guild, i) for i in islemler if i.get("islem") == "izin_sorgu"]
+    degisiklikler = [i for i in islemler if i.get("islem") != "izin_sorgu"]
+    return sorgular, degisiklikler
+
+
 class YapOnay(discord.ui.View):
     def __init__(self, guild: discord.Guild, islemler: list, yetkililer: set):
         super().__init__(timeout=180)
@@ -319,10 +348,14 @@ async def yap_metni_ve_gorunum(guild: discord.Guild, istek: str):
     islemler, not_ = await yap_hazirla(guild, istek)
     if islemler is None:
         return not_, None
-    if not islemler:
+    sorgular, islemler = sorgu_ayir(guild, islemler)
+    if not islemler and not sorgular:
         return "Yapılacak bir işlem çıkaramadım." + (f"\nNot: {not_}" if not_ else ""), None
+    metin = "\n".join(sorgular)
+    if not islemler:
+        return (metin + (f"\nNot: {not_}" if not_ else ""))[:1900], None
     satirlar = "\n".join(f"{n}. {yap_tanim(guild, i)}" for n, i in enumerate(islemler, 1))
-    metin = f"Şunları yapacağım:\n{satirlar}\n" + (f"\nNot: {not_}\n" if not_ else "") + "\nOnaylıyor musun?"
+    metin += ("\n\n" if metin else "") + f"Şunları yapacağım:\n{satirlar}\n" + (f"\nNot: {not_}\n" if not_ else "") + "\nOnaylıyor musun?"
     return metin[:1900], YapOnay(guild, islemler, {OWNER_KULLANICI_ID, guild.owner_id})
 
 
@@ -985,6 +1018,26 @@ async def on_message(message: discord.Message):
                 metin, gorunum = await yap_metni_ve_gorunum(message.guild, yap_m.group(1).strip())
             await message.reply(metin, view=gorunum, mention_author=False)
             return
+        # Sunucu sahibi "yap:" yazmadan da bir şey isterse: yönetim isteği mi diye bak, öyleyse onaya sun
+        if not yap_m and yap_yetkilisi_mi(message.author.id, message.guild):
+            async with message.channel.typing():
+                islemler, not_ = await yap_hazirla(message.guild, soru)
+            if islemler:
+                sorgular, degisiklikler = sorgu_ayir(message.guild, islemler)
+                metin = "\n".join(sorgular)
+                gorunum = None
+                if degisiklikler:
+                    satirlar = "\n".join(f"{n}. {yap_tanim(message.guild, i)}" for n, i in enumerate(degisiklikler, 1))
+                    metin += ("\n\n" if metin else "") + f"Şunları yapacağım:\n{satirlar}\n" + (f"\nNot: {not_}\n" if not_ else "") + "\nOnaylıyor musun?"
+                    gorunum = YapOnay(message.guild, degisiklikler, {OWNER_KULLANICI_ID, message.guild.owner_id})
+                elif not_:
+                    metin += f"\nNot: {not_}"
+                await message.reply(metin[:1900], view=gorunum, mention_author=False)
+                return
+            if islemler is not None and not_:
+                await message.reply(f"Bunu yapamıyorum: {not_}"[:1900], mention_author=False)
+                return
+            # Yönetim isteği değil (ya da yapay zeka cevap vermedi) -> aşağıda normal sohbet cevabı
         # Kota koruma: aynı kişi çok sık sorarsa API'ye gitmeden ⏳ ile işaretle
         simdi = time.time()
         if simdi - ai_son_kullanim.get(message.author.id, 0) < AI_BEKLEME_SANIYE:
