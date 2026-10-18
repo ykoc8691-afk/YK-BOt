@@ -34,7 +34,9 @@ AI_SISTEM_PROMPTU = (
     "Sen bir Discord kampı sunucusunun botusun. Samimi, esprili, hafif makaracı ve laf atan ama sevimli bir "
     "arkadaş gibisin; şakalaşır, takılırsın ama kırıcı olmazsın. ÖNEMLİ: Önce sana söyleneni yap veya soruyu net "
     "cevapla, espriyi ikinci planda tut. Cevaplar kısa, doğal ve Türkçe olsun. Bilmediğin bir şeyi uydurma, "
-    "bilmiyorum de. KÜFÜR ETMEZSİN, hakaret/ırkçılık/cinsiyetçilik yapmazsın, kimseyi tehdit etmezsin ve yasa dışı "
+    "bilmiyorum de. Kanal/rol/izin gibi sunucu yönetimi işlerini SOHBETTE yapamazsın ve yaptığını ya da yapamadığını "
+    "iddia etmezsin; böyle bir istek gelirse sadece 'Onay ekranı çıkmadıysa isteği rol ve kanal adlarıyla daha net yaz' de. "
+    "KÜFÜR ETMEZSİN, hakaret/ırkçılık/cinsiyetçilik yapmazsın, kimseyi tehdit etmezsin ve yasa dışı "
     "hiçbir şeye yardım etmezsin."
 )
 OGRENILEN_DOSYASI = "ogrenilenler.json"       # Bota öğretilen bilgiler (sunucu_id -> [bilgi, ...])
@@ -58,7 +60,8 @@ AI_SERT_PROMPTU = (
     "Sen bir Discord kampı sunucusunun botusun. Sert, agresif, sivri dilli ve sabırsız bir üslubun var; "
     "yaltaklanmaz, uzun uzun özür dilemezsin, laf sokarsın. Ama KÜFÜR ETMEZSİN, hakaret/ırkçılık/cinsiyetçilik "
     "yapmazsın, kimseyi gerçekten tehdit etmezsin ve yasa dışı hiçbir şeye yardım etmezsin — bunlar tartışmaya "
-    "kapalı sınırlar. Cevapların kısa ve Türkçe olsun, gereksiz uzatma."
+    "kapalı sınırlar. Sunucu yönetimi işlerini (kanal/rol/izin) sohbette yapamazsın, yaptığını ya da yapamadığını "
+    "iddia etme. Cevapların kısa ve Türkçe olsun, gereksiz uzatma."
 )
 
 
@@ -110,6 +113,7 @@ async def _gemini_dene(sistem: str, kullanici: str, json_mod: bool, token: int):
         async with aiohttp.ClientSession() as oturum:
             async with oturum.post(url, json=gövde, timeout=aiohttp.ClientTimeout(total=25)) as yanit:
                 if yanit.status != 200:
+                    print("Gemini hata:", yanit.status, (await yanit.text())[:200])
                     return None
                 veri = await yanit.json()
                 adaylar = veri.get("candidates", [])
@@ -143,6 +147,7 @@ async def _groq_dene(sistem: str, kullanici: str, json_mod: bool, token: int):
                 timeout=aiohttp.ClientTimeout(total=25),
             ) as yanit:
                 if yanit.status != 200:
+                    print("Groq hata:", yanit.status, (await yanit.text())[:200])
                     return None
                 veri = await yanit.json()
                 metin = veri["choices"][0]["message"]["content"].strip()
@@ -155,8 +160,15 @@ async def ai_calistir(sistem: str, kullanici: str, json_mod: bool = False, token
     """Önce Gemini, olmazsa Groq. İkisi de olmazsa None."""
     for deneme in (_gemini_dene, _groq_dene):
         metin = await deneme(sistem, kullanici, json_mod, token)
-        if metin:
-            return metin
+        if not metin:
+            continue
+        if json_mod:
+            try:
+                json.loads(re.sub(r"^```(?:json)?|```$", "", metin.strip(), flags=re.M).strip())
+            except json.JSONDecodeError:
+                print("Geçersiz/yarım JSON geldi, diğer sağlayıcı deneniyor:", metin[:120])
+                continue
+        return metin
     return None
 
 
@@ -257,6 +269,8 @@ async def yap_hazirla(guild: discord.Guild, istek: str, kanal=None, baglam: str 
         not_ = str(veri.get("not", "") or "")
         if not islemler and not veri.get("yonetim_istegi"):
             not_ = ""  # sohbet mesajı: yönetim notu verme, normal sohbete düşsün
+        elif not islemler and not not_:
+            not_ = "Bunu işleme çeviremedim, rol ve kanal adlarıyla daha net yazar mısın?"
         return islemler, not_
     except (json.JSONDecodeError, AttributeError):
         return None, "İsteği anlayamadım, daha net yazar mısın?"
@@ -1219,9 +1233,16 @@ async def _mesaj_isle(message: discord.Message):
             await message.reply(metin, view=gorunum, mention_author=False)
             return
         # Sunucu sahibi "yap:" yazmadan da bir şey isterse: yönetim isteği mi diye bak, öyleyse onaya sun
-        if not yap_m and yap_yetkilisi_mi(message.author.id, message.guild) and yonetim_gibi_mi(soru):
+        yonetim_baglami = ""
+        if not yap_m and yap_yetkilisi_mi(message.author.id, message.guild):
+            yonetim_baglami = await sohbet_baglami(message)
+        if not yap_m and yap_yetkilisi_mi(message.author.id, message.guild) and (
+                yonetim_gibi_mi(soru) or yonetim_gibi_mi(yonetim_baglami)):
             async with message.channel.typing():
-                islemler, not_ = await yap_hazirla(message.guild, soru, message.channel, await sohbet_baglami(message))
+                islemler, not_ = await yap_hazirla(message.guild, soru, message.channel, yonetim_baglami)
+            if islemler is None:  # Yapay zeka cevap vermedi / JSON bozuk: sohbete düşüp uydurma cevap verme
+                await message.reply(not_, mention_author=False)
+                return
             if islemler:
                 sorgular, degisiklikler = sorgu_ayir(message.guild, islemler)
                 metin = "\n".join(sorgular)
