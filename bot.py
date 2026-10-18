@@ -1,5 +1,6 @@
 import os
 import re
+import asyncio
 import json
 import time
 import discord
@@ -11,7 +12,7 @@ from discord.ext import tasks
 
 TOKEN = os.getenv("DISCORD_TOKEN")  # Token'ı koda yazma, ortam değişkeni olarak ver
 HOSGELDIN_KANAL_ADI = "genel"       # Hoş geldin mesajının atılacağı kanal
-SOHBET_KANAL_ADI = "sohbet"         # Transfer bilgisinin kişiyi etiketleyerek atılacağı kanal
+SOHBET_KANAL_ID = 1545356716252856377  # Transfer bilgisinin kişiyi etiketleyerek atılacağı kanal
 HOSGELDIN_METNI = (
     "Kampımıza hoşgeldiniz, katılmak için transfer kanalındaki tike tıklayıp ardından aşağıda açılan "
     "transfer talep kanalından ticket açıp katılabilirsiniz!"
@@ -26,7 +27,9 @@ OWNER_KULLANICI_ID = 1221139908471558144  # Sadece bu kullanıcı botu DM'den ko
 # ---------- Yapay zeka (Gemini, ücretsiz) ----------
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")  # Railway'de Variables'a eklenecek
 GEMINI_MODEL = "gemini-3.8-flash"             # AI Studio'da ücretsiz katmanda olan model
-AI_GECMIS_MESAJ = 8                           # Cevap verirken kaç önceki mesajı bağlam olarak okusun
+AI_GECMIS_MESAJ = 4                           # Cevap verirken kaç önceki mesajı bağlam olarak okusun (az = daha az kota harcar)
+AI_BEKLEME_SANIYE = 20                        # Aynı kişi art arda soruyu bu kadar saniyede bir sorabilir (kota koruma)
+ai_son_kullanim = {}                          # kullanıcı_id -> son AI kullanım zamanı
 AI_SISTEM_PROMPTU = (
     "Sen bir Discord kampı sunucusunun botusun. Sert, agresif, sivri dilli ve sabırsız bir üslubun var; "
     "yaltaklanmaz, uzun uzun özür dilemezsin, laf sokarsın. Ama KÜFÜR ETMEZSİN, hakaret/ırkçılık/cinsiyetçilik "
@@ -48,6 +51,8 @@ async def gemini_cevap(soru: str, baglam: str) -> str:
         async with aiohttp.ClientSession() as oturum:
             async with oturum.post(url, json=gövde, timeout=aiohttp.ClientTimeout(total=20)) as yanit:
                 veri = await yanit.json()
+                if yanit.status == 429:
+                    return "Ücretsiz yapay zeka limitim doldu, biraz sonra tekrar dene."
                 if yanit.status != 200:
                     hata = veri.get("error", {}).get("message", "bilinmeyen hata")
                     return f"Şu an cevap veremiyorum, teknik sorun var: {hata[:200]}"
@@ -346,7 +351,10 @@ class Bot(discord.Client):
         self.tree = app_commands.CommandTree(self)
 
     async def setup_hook(self):
-        await self.tree.sync()
+        try:
+            await self.tree.sync()
+        except discord.HTTPException as e:  # Komut kaydı hata verse de bot çökmesin
+            print(f"Komutlar senkronize edilemedi: {e}")
         sure_kontrol.start()
         eski_kayit_temizle.start()
         mute_kontrol.start()
@@ -644,9 +652,25 @@ async def dm_komut_isle(message: discord.Message):
 async def on_message(message: discord.Message):
     if message.author.bot:
         return
-    if message.guild is None:  # DM: sadece owner komut verebilir
-        if message.author.id == OWNER_KULLANICI_ID and message.content.strip().startswith("!"):
-            await dm_komut_isle(message)
+    if message.guild is None:  # DM
+        if message.author.id == OWNER_KULLANICI_ID:
+            if message.content.strip().startswith("!"):
+                await dm_komut_isle(message)
+            return
+        # Owner değilse: botun DM'ine yazdığı mesajı, kim yazdığıyla beraber owner'a ilet
+        sahip = bot.get_user(OWNER_KULLANICI_ID)
+        if sahip is None:
+            try:
+                sahip = await bot.fetch_user(OWNER_KULLANICI_ID)
+            except discord.HTTPException:
+                sahip = None
+        if sahip:
+            icerik = message.content or "*(metin yok)*"
+            ekler = "\n".join(a.url for a in message.attachments)
+            metin = f"**{message.author}** (`{message.author.id}`) sana DM'den yazdı:\n{icerik}"
+            if ekler:
+                metin += f"\n📎 {ekler}"
+            await dm_dene(sahip, metin[:2000])
         return
     if message.guild:  # Mesajı kaydet (silinirse /silinmislistele ile görülebilsin)
         ekler = "\n".join(a.url for a in message.attachments)
@@ -672,6 +696,15 @@ async def on_message(message: discord.Message):
         soru = soru.strip()
         if not soru:
             return
+        # Kota koruma: aynı kişi çok sık sorarsa API'ye gitmeden ⏳ ile işaretle
+        simdi = time.time()
+        if simdi - ai_son_kullanim.get(message.author.id, 0) < AI_BEKLEME_SANIYE:
+            try:
+                await message.add_reaction("⏳")
+            except discord.HTTPException:
+                pass
+            return
+        ai_son_kullanim[message.author.id] = simdi
         async with message.channel.typing():
             gecmis = []
             async for onceki in message.channel.history(limit=AI_GECMIS_MESAJ, before=message):
@@ -698,7 +731,7 @@ async def on_member_join(member: discord.Member):
     if kanal:
         await kanal.send(f"Sunucuya hoş geldin {member.mention}! 🎉")
 
-    sohbet = discord.utils.get(member.guild.text_channels, name=SOHBET_KANAL_ADI)
+    sohbet = member.guild.get_channel(SOHBET_KANAL_ID)
     if sohbet:
         try:
             await sohbet.send(f"{member.mention} {HOSGELDIN_METNI}")
@@ -770,6 +803,64 @@ async def clear(interaction: discord.Interaction, sayi: app_commands.Range[int, 
 
 @clear.error
 async def clear_hata(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    await izin_hatasi(interaction, error, "Mesajları Yönet")
+
+
+# 5b) /silkişi -> seçilen kişinin bu kanaldaki mesajlarını siler (sayı verilmezse hepsini)
+SILKISI_TARAMA_LIMITI = 20000  # Bir kanalda en fazla bu kadar eski mesaja kadar tarar
+
+
+@bot.tree.command(name="silkişi", description="Seçtiğin kişinin bu kanaldaki mesajlarını siler (sayı yazmazsan hepsini)")
+@app_commands.describe(kisi="Mesajları silinecek kişi (sunucudan ayrıldıysa ID yapıştır)",
+                       sayi="Kaç mesajı silinsin (boş bırakırsan bu kanaldaki tüm mesajları silinir)")
+@app_commands.guild_only()
+@app_commands.default_permissions(manage_messages=True)
+@app_commands.checks.has_permissions(manage_messages=True)
+@app_commands.checks.bot_has_permissions(manage_messages=True, read_message_history=True)
+async def silkisi(interaction: discord.Interaction, kisi: discord.User, sayi: app_commands.Range[int, 1, 10000] = None):
+    await interaction.response.defer(ephemeral=True)  # Silme uzun sürebilir
+    kanal = interaction.channel
+
+    # En yeniden eskiye doğru kişinin mesajlarını topla (sayi varsa o kadar, yoksa hepsi)
+    hedefler = []
+    async for m in kanal.history(limit=SILKISI_TARAMA_LIMITI):
+        if m.author.id == kisi.id:
+            hedefler.append(m)
+            if sayi and len(hedefler) >= sayi:
+                break
+
+    if not hedefler:
+        return await interaction.followup.send(f"**{kisi}** kişisinin bu kanalda silinecek mesajı bulunamadı.", ephemeral=True)
+
+    for m in hedefler:
+        clear_idleri.add(m.id)  # Yetkili sildi, "silinmiş mesajlar" listesine girmesin
+
+    simdi = discord.utils.utcnow()
+    yeni = [m for m in hedefler if (simdi - m.created_at).days < 14]  # Toplu silinebilenler
+    eski = [m for m in hedefler if (simdi - m.created_at).days >= 14]  # Tek tek silinecekler
+    silinen = 0
+    try:
+        for i in range(0, len(yeni), 100):
+            parca = yeni[i:i + 100]
+            if len(parca) == 1:
+                await parca[0].delete()
+            else:
+                await kanal.delete_messages(parca)
+            silinen += len(parca)
+        for m in eski:
+            await m.delete()
+            silinen += 1
+            await asyncio.sleep(0.4)  # Discord hız sınırına takılmamak için
+    except discord.HTTPException:
+        await interaction.followup.send(
+            f"{silinen} mesaj silindi, ama işlem bir hata yüzünden yarıda kaldı (botun izni/hız sınırı).", ephemeral=True
+        )
+        return
+    await interaction.followup.send(f"**{kisi}** kişisinin {silinen} mesajı silindi.", ephemeral=True)
+
+
+@silkisi.error
+async def silkisi_hata(interaction: discord.Interaction, error: app_commands.AppCommandError):
     await izin_hatasi(interaction, error, "Mesajları Yönet")
 
 
