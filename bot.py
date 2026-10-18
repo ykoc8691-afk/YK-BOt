@@ -25,7 +25,7 @@ OWNER_KULLANICI_ID = 1221139908471558144  # Sadece bu kullanıcı botu DM'den ko
 
 # ---------- Yapay zeka (Gemini, ücretsiz) ----------
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")  # Railway'de Variables'a eklenecek
-GEMINI_MODEL = "gemini-2.0-flash"             # AI Studio'da ücretsiz katmanda olan model
+GEMINI_MODEL = "gemini-3.8-flash"             # AI Studio'da ücretsiz katmanda olan model
 AI_GECMIS_MESAJ = 8                           # Cevap verirken kaç önceki mesajı bağlam olarak okusun
 AI_SISTEM_PROMPTU = (
     "Sen bir Discord kampı sunucusunun botusun. Sert, agresif, sivri dilli ve sabırsız bir üslubun var; "
