@@ -27,7 +27,7 @@ OWNER_KULLANICI_ID = 1221139908471558144  # Sadece bu kullanıcı botu DM'den ko
 # ---------- Yapay zeka (Gemini, ücretsiz) ----------
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")  # Railway'de Variables'a eklenecek
 GEMINI_MODEL = "gemini-3.5-flash-lite"        # En hızlı/hafif Flash-Lite modeli (daha yüksek ücretsiz kota hedefi)
-AI_GECMIS_MESAJ = 4                           # Cevap verirken kaç önceki mesajı bağlam olarak okusun (az = daha az kota harcar)
+AI_GECMIS_MESAJ = 6                           # Cevap verirken kaç önceki mesajı bağlam olarak okusun (az = daha az kota harcar)
 AI_BEKLEME_SANIYE = 20                        # Aynı kişi art arda soruyu bu kadar saniyede bir sorabilir (kota koruma)
 ai_son_kullanim = {}                          # kullanıcı_id -> son AI kullanım zamanı
 AI_SISTEM_PROMPTU = (
@@ -169,45 +169,91 @@ async def gemini_cevap(soru: str, baglam: str, sistem: str = None) -> str:
     return "Şu an iki yapay zeka da cevap vermiyor (limit dolmuş ya da teknik sorun var), biraz sonra tekrar dene."
 
 
+async def sohbet_baglami(message: discord.Message) -> str:
+    """Kanaldaki son birkaç mesajı (botun cevapları dahil) kısa bir bağlam metni yapar. Yapay zeka API'si harcamaz."""
+    satirlar = []
+    async for onceki in message.channel.history(limit=AI_GECMIS_MESAJ, before=message):
+        if onceki.content:
+            satirlar.append(f"{onceki.author.display_name}: {onceki.content[:300]}")
+    satirlar.reverse()
+    return "Son konuşmalar:\n" + "\n".join(satirlar) if satirlar else ""
+
+
+YONETIM_KELIMELERI = ("kanal", "kategori", "rol", "izin", "yetki", "görs", "göreb", "görün", "ayarla",
+                      "oluştur", "ekle", "adını", "ismini", "sesli", "yazılı", "yazamas", "yazabil")
+
+
+def yonetim_gibi_mi(soru: str) -> bool:
+    """Ucuz ön eleme: yönetim kelimesi yoksa yönetim isteği için yapay zekaya hiç sorma (API tasarrufu)."""
+    k = soru.lower()
+    return any(w in k for w in YONETIM_KELIMELERI)
+
+
+async def ogrenme_logla(guild: discord.Guild, metin: str):
+    kid = json_yukle(AYAR_DOSYASI).get(str(guild.id), {}).get("ogrenme_log_kanal")
+    kanal = guild.get_channel(kid) if kid else None
+    if kanal:
+        try:
+            await kanal.send(metin[:1900])
+        except discord.HTTPException:
+            pass
+
+
 # ---------- Yapay zekayla sunucu yönetimi (/yap veya "@bot yap: ...") ----------
 YAP_SISTEM = (
     "Sen bir Discord sunucu yönetim asistanısın. Kullanıcının isteğini aşağıdaki işlemlere çevir ve SADECE JSON döndür: "
-    '{"islemler":[...], "not":"anlamadığın veya yapılamayan şeyler için kısa açıklama (yoksa boş)"}.\n'
-    "İşlemler:\n"
-    '- {"islem":"kanal_izin","kanal":<kanal id>,"rol":<rol id>,"izin":"gorsun"|"gormesin"|"yazsin"|"yazmasin"|"sifirla"}\n'
+    '{"yonetim_istegi":true|false,"islemler":[...],"not":"yapılamayan şeyler için kısa açıklama (yoksa boş)"}.\n'
+    "İşlemler (SIRAYLA uygulanır; önce oluşturulması gereken şeyler önce yazılmalı):\n"
+    '- {"islem":"kategori_olustur","ad":"...","ref":"k1"}\n'
+    '- {"islem":"kanal_olustur","ad":"...","tur":"yazi"|"ses","kategori":<kategori id | önceki işlemin ref\'i | null>,"ref":"c1"}\n'
+    '- {"islem":"kategori_sirala","kategori":<id | ref>,"konum":"en_ust"|"en_alt"}\n'
+    '- {"islem":"kategori_gorunurluk","kategori":<id | ref>,"rol":<rol id>,"mod":"ve_ustu"|"sadece"}  '
+    '(kategorinin ve içindeki TÜM kanalların sadece o rolü ("sadece") veya o rol ve hiyerarşide üstündeki rolleri ("ve_ustu") '
+    "görmesini sağlar; @everyone görmez)\n"
+    '- {"islem":"kanal_izin","kanal":<kanal id | ref>,"rol":<rol id>,"kapsam":"rol"|"ve_ustu"|"hepsi","ver":[...],"engelle":[...]}  '
+    "(kapsam: sadece o rol / o rol ve hiyerarşide üstündekiler / sunucudaki tüm roller (hepsi, rol yazma). "
+    "ver ve engelle listelerinde kullanılabilecek izinler: view_channel, send_messages, read_message_history, manage_messages, "
+    "add_reactions, attach_files, embed_links, mention_everyone, create_public_threads, send_messages_in_threads, use_external_emojis. "
+    "'Mesaj silme yetkisi' = manage_messages. 'Yönetici hariç kimse X yapamasın' = kapsam hepsi + engelle (yöneticiler zaten etkilenmez))\n"
+    '- {"islem":"kanal_adi","kanal":<id | ref>,"yeni_ad":"..."}\n'
     '- {"islem":"rol_olustur","ad":"...","renk":"#RRGGBB"}  (renk opsiyonel)\n'
     '- {"islem":"rol_ver","kisi":<kullanıcı id>,"rol":<rol id>}\n'
     '- {"islem":"rol_al","kisi":<kullanıcı id>,"rol":<rol id>}\n'
-    '- {"islem":"kanal_olustur","ad":"...","tur":"yazi"|"ses","kategori":<kategori id veya null>}\n'
-    '- {"islem":"kanal_adi","kanal":<kanal id>,"yeni_ad":"..."}\n'
-    '- {"islem":"kategori_gorunurluk","kategori":<kategori id>,"rol":<rol id>,"mod":"ve_ustu"|"sadece"}  '
-    '(kategorideki TÜM kanalları sadece o rolün ("sadece") veya o rol ve hiyerarşide üstündeki rollerin ("ve_ustu") görmesini sağlar)\n'
     '- {"islem":"izin_sorgu","kanal":<kanal id>,"rol":<rol id veya null>,"kisi":<kullanıcı id veya null>,"detay":true|false}  '
-    '(sadece soru: "X şu kanalı görebiliyor mu / yazabiliyor mu / yetkilerini say" gibi; hiçbir şeyi değiştirmez. '
-    'Yetkileri listele/say/neler deniyorsa detay true, evet-hayır sorusuysa false)\n'
-    "Birden fazla rol/kanal gerekiyorsa her biri için ayrı işlem yaz (en fazla 10 işlem). "
-    "Rol ve kanal için verilen listedeki id'leri kullan, kullanıcılar istekte <@id> olarak geçer. "
+    '(sadece soru: "X şu kanalı görebiliyor mu / yetkilerini say" gibi; hiçbir şeyi değiştirmez. '
+    "Yetkileri listele/say deniyorsa detay true, evet-hayır sorusuysa false)\n"
+    "Henüz var olmayan bir kategori/kanal için 'ref' ver ve sonraki işlemlerde id yerine o ref'i yaz. "
+    "En fazla 12 işlem. Rol ve kanal için verilen listedeki id'leri kullan, kullanıcılar istekte <@id> olarak geçer. "
     "'Herkes' demek @everyone rolüdür. Listede olmayan bir şey istenirse işlem ekleme, not'a yaz. "
     "Silme işlemleri ve yönetici izni verme DESTEKLENMİYOR; istenirse not'a yaz. "
-    "JSON'a ayrıca \"yonetim_istegi\": true|false ekle: mesaj sunucuda rol/kanal/izin işi veya izin sorusuysa true, "
+    "yonetim_istegi: mesaj sunucuda rol/kanal/izin işi veya izin sorusuysa true, "
     "sohbet/genel soru/espri ise false (o zaman islemler boş, not boş olsun). "
+    "'Son konuşmalar' sadece bağlam içindir; 'sesli olmasın' gibi kısa devam mesajları önceki isteğe aittir, ona göre yorumla. "
     "\"Bu kanal\" denirse 'İsteğin yazıldığı kanal' olarak verilen kanaldır."
 )
 
+IZIN_ADLARI = {
+    "view_channel": "kanalı görme", "send_messages": "mesaj yazma", "read_message_history": "geçmişi okuma",
+    "manage_messages": "mesaj silme/yönetme", "add_reactions": "tepki ekleme", "attach_files": "dosya ekleme",
+    "embed_links": "link önizleme", "mention_everyone": "@everyone etiketleme",
+    "create_public_threads": "konu açma", "send_messages_in_threads": "konularda yazma",
+    "use_external_emojis": "dış emoji kullanma",
+}
 
-async def yap_hazirla(guild: discord.Guild, istek: str, kanal=None):
+
+async def yap_hazirla(guild: discord.Guild, istek: str, kanal=None, baglam: str = ""):
     """İsteği işlem listesine çevirir. (islemler, not) döner; yapay zeka cevap vermezse (None, hata)."""
     roller = "; ".join(f"{r.name}={r.id}" for r in guild.roles[:100])
     kanallar = "; ".join(f"{k.name} [{k.type.name}]={k.id}" for k in guild.channels[:150])
     suan = f"\nİsteğin yazıldığı kanal: {kanal.name}={kanal.id}" if kanal else ""
-    metin = await ai_calistir(YAP_SISTEM, f"Roller: {roller}\nKanallar: {kanallar}{suan}\n\nİstek: {istek}",
-                              json_mod=True, token=1000)
+    metin = await ai_calistir(YAP_SISTEM, f"Roller: {roller}\nKanallar: {kanallar}{suan}\n\n{baglam}\n\nİstek: {istek}",
+                              json_mod=True, token=2000)
     if not metin:
         return None, "Yapay zeka şu an cevap vermiyor, biraz sonra tekrar dene."
     try:
         metin = re.sub(r"^```(?:json)?|```$", "", metin.strip(), flags=re.M).strip()
         veri = json.loads(metin)
-        islemler = [i for i in veri.get("islemler", []) if isinstance(i, dict)][:10]
+        islemler = [i for i in veri.get("islemler", []) if isinstance(i, dict)][:12]
         not_ = str(veri.get("not", "") or "")
         if not islemler and not veri.get("yonetim_istegi"):
             not_ = ""  # sohbet mesajı: yönetim notu verme, normal sohbete düşsün
@@ -216,7 +262,10 @@ async def yap_hazirla(guild: discord.Guild, istek: str, kanal=None):
         return None, "İsteği anlayamadım, daha net yazar mısın?"
 
 
-def _id_ad(guild: discord.Guild, tur: str, deger):
+def _id_ad(guild: discord.Guild, tur: str, deger, refs: dict = None):
+    """id (veya önceki işlemde oluşturulan 'ref') -> kanal/rol/üye nesnesi."""
+    if refs and isinstance(deger, str) and deger in refs:
+        return refs[deger]
     try:
         i = int(deger)
     except (TypeError, ValueError):
@@ -231,43 +280,113 @@ def _gorunur_roller(guild: discord.Guild, rol: discord.Role, mod) -> list:
     return [r for r in guild.roles if r.position >= rol.position and r.id != guild.id]
 
 
-def yap_tanim(guild: discord.Guild, i: dict) -> str:
+def _kapsam_rolleri(guild: discord.Guild, rol, kapsam) -> list:
+    if kapsam == "hepsi":
+        return list(guild.roles)
+    if not rol:
+        return []
+    return _gorunur_roller(guild, rol, "ve_ustu") if kapsam == "ve_ustu" else [rol]
+
+
+def _izin_listesi(liste) -> list:
+    return [p for p in (liste or []) if isinstance(p, str) and p in IZIN_ADLARI]
+
+
+def yap_tanimlar(guild: discord.Guild, islemler: list) -> list:
+    """Her işlemi okunur bir cümleye çevirir; henüz oluşturulmamış 'ref'ler plandaki adlarıyla gösterilir."""
+    ref_adlari = {i["ref"]: i.get("ad") for i in islemler if isinstance(i.get("ref"), str) and i.get("ad")}
+    return [yap_tanim(guild, i, ref_adlari) for i in islemler]
+
+
+def yap_tanim(guild: discord.Guild, i: dict, ref_adlari: dict = None) -> str:
+    ref_adlari = ref_adlari or {}
+
+    def kanal_adi(deger):
+        if isinstance(deger, str) and deger in ref_adlari:
+            return f"{ref_adlari[deger]} (yeni)"
+        k = _id_ad(guild, "kanal", deger)
+        return k.name if k else "?"
+
     t = i.get("islem")
-    kanal, rol, kisi = _id_ad(guild, "kanal", i.get("kanal") or i.get("kategori")), _id_ad(guild, "rol", i.get("rol")), _id_ad(guild, "kisi", i.get("kisi"))
-    izinler = {"gorsun": "görsün", "gormesin": "görmesin", "yazsin": "yazabilsin", "yazmasin": "yazamasın", "sifirla": "izni sıfırlansın"}
-    if t == "kanal_izin":
-        return f"**{rol.name if rol else '?'}** rolü **#{kanal.name if kanal else '?'}** kanalında: {izinler.get(i.get('izin'), '?')}"
+    rol = _id_ad(guild, "rol", i.get("rol"))
+    kisi = _id_ad(guild, "kisi", i.get("kisi"))
+    if t == "kategori_olustur":
+        return f"**{i.get('ad')}** adında kategori oluştur"
+    if t == "kanal_olustur":
+        kat = f" ({kanal_adi(i.get('kategori'))} kategorisinde)" if i.get("kategori") else ""
+        return f"**{i.get('ad')}** adında {'ses' if i.get('tur') == 'ses' else 'yazı'} kanalı oluştur{kat}"
+    if t == "kategori_sirala":
+        return f"**{kanal_adi(i.get('kategori'))}** kategorisini {'en üste' if i.get('konum') != 'en_alt' else 'en alta'} taşı"
     if t == "kategori_gorunurluk":
-        if not kanal or not isinstance(kanal, discord.CategoryChannel) or not rol:
-            return "Kategori görünürlüğü ayarla (kategori veya rol bulunamadı)"
-        roller_ = _gorunur_roller(guild, rol, i.get("mod"))
-        kapsam = f"**{rol.name}** ve üstü ({len(roller_)} rol)" if i.get("mod") != "sadece" else f"sadece **{rol.name}**"
-        return (f"**{kanal.name}** kategorisi ve içindeki {len(kanal.channels)} kanal: {kapsam} görsün, "
-                f"@everyone ve diğerleri görmesin")
+        if not rol:
+            return "Kategori görünürlüğü ayarla (rol bulunamadı)"
+        kapsam = f"**{rol.name}** ve üstü ({len(_gorunur_roller(guild, rol, 've_ustu'))} rol)" \
+            if i.get("mod") != "sadece" else f"sadece **{rol.name}**"
+        return f"**{kanal_adi(i.get('kategori'))}** kategorisi ve içindeki tüm kanallar: {kapsam} görsün, @everyone ve diğerleri görmesin"
+    if t == "kanal_izin":
+        kapsam = i.get("kapsam") or "rol"
+        if kapsam == "hepsi":
+            kim = "**tüm roller**"
+        elif kapsam == "ve_ustu":
+            kim = f"**{rol.name if rol else '?'}** ve üstü roller"
+        else:
+            kim = f"**{rol.name if rol else '?'}** rolü"
+        ver = [IZIN_ADLARI[p] for p in _izin_listesi(i.get("ver"))]
+        engel = [IZIN_ADLARI[p] for p in _izin_listesi(i.get("engelle"))]
+        eski = {"gorsun": "görsün", "gormesin": "görmesin", "yazsin": "yazabilsin", "yazmasin": "yazamasın", "sifirla": "izni sıfırlansın"}
+        parca = []
+        if ver:
+            parca.append("verilen: " + ", ".join(ver))
+        if engel:
+            parca.append("engellenen: " + ", ".join(engel))
+        if i.get("izin") in eski:
+            parca.append(eski[i["izin"]])
+        return f"**#{kanal_adi(i.get('kanal'))}** kanalında {kim} → " + ("; ".join(parca) or "?")
     if t == "rol_olustur":
         return f"**{i.get('ad')}** adında rol oluştur"
     if t in ("rol_ver", "rol_al"):
         return f"**{kisi.display_name if kisi else '?'}** kişisine **{rol.name if rol else '?'}** rolünü {'ver' if t == 'rol_ver' else 'al'}"
-    if t == "kanal_olustur":
-        return f"**{i.get('ad')}** adında {'ses' if i.get('tur') == 'ses' else 'yazı'} kanalı oluştur"
     if t == "kanal_adi":
-        return f"**#{kanal.name if kanal else '?'}** kanalının adını **{i.get('yeni_ad')}** yap"
+        return f"**#{kanal_adi(i.get('kanal'))}** kanalının adını **{i.get('yeni_ad')}** yap"
     return f"Desteklenmeyen işlem: {t}"
 
 
-async def yap_uygula(guild: discord.Guild, i: dict, yapan: str) -> str:
+async def yap_uygula(guild: discord.Guild, i: dict, yapan: str, refs: dict, ref_adlari: dict = None) -> str:
     t = i.get("islem")
     sebep = f"Bot yönetimi: {yapan}"
-    tanim = yap_tanim(guild, i)
-    kanal, rol, kisi = _id_ad(guild, "kanal", i.get("kanal") or i.get("kategori")), _id_ad(guild, "rol", i.get("rol")), _id_ad(guild, "kisi", i.get("kisi"))
+    tanim = yap_tanim(guild, i, ref_adlari)
+    rol = _id_ad(guild, "rol", i.get("rol"))
+    kisi = _id_ad(guild, "kisi", i.get("kisi"))
+    kanal = _id_ad(guild, "kanal", i.get("kanal") or i.get("kategori"), refs)
     try:
-        if t == "kategori_gorunurluk":
+        if t == "kategori_olustur":
+            nesne = await guild.create_category(str(i.get("ad"))[:100], reason=sebep)
+            if isinstance(i.get("ref"), str):
+                refs[i["ref"]] = nesne
+        elif t == "kanal_olustur":
+            kategori = _id_ad(guild, "kanal", i.get("kategori"), refs)
+            kategori = kategori if isinstance(kategori, discord.CategoryChannel) else None
+            ad = str(i.get("ad"))[:100]
+            if i.get("tur") == "ses":
+                nesne = await guild.create_voice_channel(ad, category=kategori, reason=sebep)
+            else:
+                nesne = await guild.create_text_channel(ad, category=kategori, reason=sebep)
+            if isinstance(i.get("ref"), str):
+                refs[i["ref"]] = nesne
+        elif t == "kategori_sirala":
+            if not isinstance(kanal, discord.CategoryChannel):
+                return f"❌ {tanim} (kategori bulunamadı)"
+            konum = 0 if i.get("konum") != "en_alt" else len(guild.categories)
+            await kanal.edit(position=konum, reason=sebep)
+        elif t == "kategori_gorunurluk":
             if not isinstance(kanal, discord.CategoryChannel) or not rol:
-                return f"❌ {tanim}"
+                return f"❌ {tanim} (kategori veya rol bulunamadı)"
             izinli = _gorunur_roller(guild, rol, i.get("mod"))
             izinli_idler = {r.id for r in izinli}
-            hedefler = [kanal] + list(kanal.channels)
-            for h in hedefler:
+            hedefler = {kanal.id: kanal}
+            for c in list(kanal.channels) + [v for v in refs.values() if getattr(v, "category_id", None) == kanal.id]:
+                hedefler[c.id] = c
+            for h in hedefler.values():
                 await h.set_permissions(guild.default_role, view_channel=False, reason=sebep)
                 for r in izinli:
                     await h.set_permissions(r, view_channel=True, reason=sebep)
@@ -278,26 +397,31 @@ async def yap_uygula(guild: discord.Guild, i: dict, yapan: str) -> str:
                         ow.view_channel = None
                         await h.set_permissions(hedef_, overwrite=(None if ow.is_empty() else ow), reason=sebep)
                 await h.set_permissions(guild.me, view_channel=True, reason=sebep)  # Bot kendini kilitlemesin
-            return f"✅ {tanim}"
-        if t == "kanal_izin":
-            if not kanal or not rol:
-                return f"❌ {tanim} (kanal veya rol bulunamadı)"
-            izin = i.get("izin")
-            if izin == "sifirla":
-                await kanal.set_permissions(rol, overwrite=None, reason=sebep)
-            else:
-                ow = kanal.overwrites_for(rol)
-                if izin == "gorsun":
-                    ow.view_channel = True
-                elif izin == "gormesin":
-                    ow.view_channel = False
-                elif izin == "yazsin":
-                    ow.send_messages = True
-                elif izin == "yazmasin":
-                    ow.send_messages = False
-                else:
-                    return f"❌ {tanim} (bilinmeyen izin)"
-                await kanal.set_permissions(rol, overwrite=ow, reason=sebep)
+        elif t == "kanal_izin":
+            if not kanal:
+                return f"❌ {tanim} (kanal bulunamadı)"
+            kapsam = i.get("kapsam") or "rol"
+            roller = _kapsam_rolleri(guild, rol, kapsam)
+            if not roller:
+                return f"❌ {tanim} (rol bulunamadı)"
+            ver, engel = _izin_listesi(i.get("ver")), _izin_listesi(i.get("engelle"))
+            eski = {"gorsun": ("view_channel", True), "gormesin": ("view_channel", False),
+                    "yazsin": ("send_messages", True), "yazmasin": ("send_messages", False)}
+            sifirla = i.get("izin") == "sifirla"
+            if not (ver or engel or sifirla or i.get("izin") in eski):
+                return f"❌ {tanim} (yapılacak izin belirtilmemiş)"
+            for r in roller:
+                if sifirla:
+                    await kanal.set_permissions(r, overwrite=None, reason=sebep)
+                    continue
+                ow = kanal.overwrites_for(r)
+                for p in ver:
+                    setattr(ow, p, True)
+                for p in engel:
+                    setattr(ow, p, False)
+                if i.get("izin") in eski:
+                    setattr(ow, eski[i["izin"]][0], eski[i["izin"]][1])
+                await kanal.set_permissions(r, overwrite=ow, reason=sebep)
         elif t == "rol_olustur":
             renk = discord.Color.default()
             m = re.fullmatch(r"#?([0-9a-fA-F]{6})", str(i.get("renk") or ""))
@@ -313,14 +437,6 @@ async def yap_uygula(guild: discord.Guild, i: dict, yapan: str) -> str:
                 await kisi.add_roles(rol, reason=sebep)
             else:
                 await kisi.remove_roles(rol, reason=sebep)
-        elif t == "kanal_olustur":
-            kategori = _id_ad(guild, "kanal", i.get("kategori"))
-            kategori = kategori if isinstance(kategori, discord.CategoryChannel) else None
-            ad = str(i.get("ad"))[:100]
-            if i.get("tur") == "ses":
-                await guild.create_voice_channel(ad, category=kategori, reason=sebep)
-            else:
-                await guild.create_text_channel(ad, category=kategori, reason=sebep)
         elif t == "kanal_adi":
             if not kanal:
                 return f"❌ {tanim} (kanal bulunamadı)"
@@ -330,7 +446,11 @@ async def yap_uygula(guild: discord.Guild, i: dict, yapan: str) -> str:
     except discord.Forbidden:
         return f"❌ {tanim} (botun yetkisi yetmedi; bot rolü hedef rolün/kanalın üstünde olmalı)"
     except discord.HTTPException as e:
-        return f"❌ {tanim} (Discord hatası: {e.text[:80]})"
+        return f"❌ {tanim} (Discord hatası: {str(e.text)[:80]})"
+    except Exception as e:  # beklenmeyen hata: konsola yaz, kullanıcıya kısa bilgi ver
+        import traceback
+        traceback.print_exc()
+        return f"❌ {tanim} (beklenmeyen hata: {type(e).__name__})"
     return f"✅ {tanim}"
 
 
@@ -388,7 +508,10 @@ class YapOnay(discord.ui.View):
             return await inter.response.send_message("Bu buton sana ait değil.", ephemeral=True)
         self.stop()
         await inter.response.edit_message(content="Uygulanıyor...", view=None)
-        sonuc = [await yap_uygula(self.guild, i, str(inter.user)) for i in self.islemler]
+        refs, ref_adlari, sonuc = {}, {i["ref"]: i.get("ad") for i in self.islemler
+                                       if isinstance(i.get("ref"), str) and i.get("ad")}, []
+        for i in self.islemler:
+            sonuc.append(await yap_uygula(self.guild, i, str(inter.user), refs, ref_adlari))
         await inter.edit_original_response(content="\n".join(sonuc)[:1900])
 
     @discord.ui.button(label="İptal", style=discord.ButtonStyle.secondary)
@@ -403,9 +526,9 @@ def yap_yetkilisi_mi(kullanici_id: int, guild: discord.Guild) -> bool:
     return kullanici_id in (OWNER_KULLANICI_ID, guild.owner_id)
 
 
-async def yap_metni_ve_gorunum(guild: discord.Guild, istek: str, kanal=None):
+async def yap_metni_ve_gorunum(guild: discord.Guild, istek: str, kanal=None, baglam: str = ""):
     """(mesaj metni, view veya None) döner."""
-    islemler, not_ = await yap_hazirla(guild, istek, kanal)
+    islemler, not_ = await yap_hazirla(guild, istek, kanal, baglam)
     if islemler is None:
         return not_, None
     sorgular, islemler = sorgu_ayir(guild, islemler)
@@ -414,7 +537,7 @@ async def yap_metni_ve_gorunum(guild: discord.Guild, istek: str, kanal=None):
     metin = "\n".join(sorgular)
     if not islemler:
         return (metin + (f"\nNot: {not_}" if not_ else ""))[:1900], None
-    satirlar = "\n".join(f"{n}. {yap_tanim(guild, i)}" for n, i in enumerate(islemler, 1))
+    satirlar = "\n".join(f"{n}. {t_}" for n, t_ in enumerate(yap_tanimlar(guild, islemler), 1))
     metin += ("\n\n" if metin else "") + f"Şunları yapacağım:\n{satirlar}\n" + (f"\nNot: {not_}\n" if not_ else "") + "\nOnaylıyor musun?"
     return metin[:1900], YapOnay(guild, islemler, {OWNER_KULLANICI_ID, guild.owner_id})
 
@@ -1016,6 +1139,20 @@ async def dm_komut_isle(message: discord.Message):
 # 0) !format yazılınca başvuru formatını gönderir
 @bot.event
 async def on_message(message: discord.Message):
+    """Asıl iş _mesaj_isle'de; beklenmeyen hata olursa konsola yazar ve botu etiketleyen kişiye kısa bilgi verir."""
+    try:
+        await _mesaj_isle(message)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        if message.guild and bot.user and message.content.strip().startswith((f"<@{bot.user.id}>", f"<@!{bot.user.id}>")):
+            try:
+                await message.reply(f"Bir hata oldu ({type(e).__name__}), Railway Deploy Logs'a bak.", mention_author=False)
+            except discord.HTTPException:
+                pass
+
+
+async def _mesaj_isle(message: discord.Message):
     if message.author.bot:
         return
     if message.guild is None:  # DM
@@ -1068,26 +1205,29 @@ async def on_message(message: discord.Message):
         # "@bot öğren: ..." -> sadece sahip/yöneticiler bota bilgi öğretebilir
         ogren_m = re.match(r"(?is)^(?:öğren|ogren|ezberle)(?:\s*:\s*|\s+)(.+)$", soru)
         if ogren_m and (message.author.id == OWNER_KULLANICI_ID or message.author.guild_permissions.administrator):
-            adet = ogrenilen_ekle(message.guild.id, ogren_m.group(1).strip())
+            bilgi = ogren_m.group(1).strip()
+            adet = ogrenilen_ekle(message.guild.id, bilgi)
             await message.reply(f"Tamam, ezberledim. (Toplam {adet} bilgi biliyorum)", mention_author=False)
+            await ogrenme_logla(message.guild, f"📚 **#{adet}** öğrenildi ({message.author.display_name}): {bilgi[:500]}")
             return
         # "@bot yap: ..." -> sadece sunucu sahibi / bot sahibi sunucuda işlem yaptırabilir
         yap_m = re.match(r"(?is)^yap\s*:\s*(.+)$", soru)
         if yap_m and yap_yetkilisi_mi(message.author.id, message.guild):
             async with message.channel.typing():
-                metin, gorunum = await yap_metni_ve_gorunum(message.guild, yap_m.group(1).strip(), message.channel)
+                metin, gorunum = await yap_metni_ve_gorunum(
+                    message.guild, yap_m.group(1).strip(), message.channel, await sohbet_baglami(message))
             await message.reply(metin, view=gorunum, mention_author=False)
             return
         # Sunucu sahibi "yap:" yazmadan da bir şey isterse: yönetim isteği mi diye bak, öyleyse onaya sun
-        if not yap_m and yap_yetkilisi_mi(message.author.id, message.guild):
+        if not yap_m and yap_yetkilisi_mi(message.author.id, message.guild) and yonetim_gibi_mi(soru):
             async with message.channel.typing():
-                islemler, not_ = await yap_hazirla(message.guild, soru, message.channel)
+                islemler, not_ = await yap_hazirla(message.guild, soru, message.channel, await sohbet_baglami(message))
             if islemler:
                 sorgular, degisiklikler = sorgu_ayir(message.guild, islemler)
                 metin = "\n".join(sorgular)
                 gorunum = None
                 if degisiklikler:
-                    satirlar = "\n".join(f"{n}. {yap_tanim(message.guild, i)}" for n, i in enumerate(degisiklikler, 1))
+                    satirlar = "\n".join(f"{n}. {t_}" for n, t_ in enumerate(yap_tanimlar(message.guild, degisiklikler), 1))
                     metin += ("\n\n" if metin else "") + f"Şunları yapacağım:\n{satirlar}\n" + (f"\nNot: {not_}\n" if not_ else "") + "\nOnaylıyor musun?"
                     gorunum = YapOnay(message.guild, degisiklikler, {OWNER_KULLANICI_ID, message.guild.owner_id})
                 elif not_:
@@ -1108,12 +1248,7 @@ async def on_message(message: discord.Message):
             return
         ai_son_kullanim[message.author.id] = simdi
         async with message.channel.typing():
-            gecmis = []
-            async for onceki in message.channel.history(limit=AI_GECMIS_MESAJ, before=message):
-                if onceki.content:
-                    gecmis.append(f"{onceki.author.display_name}: {onceki.content}")
-            gecmis.reverse()
-            baglam = "Son konuşmalar:\n" + "\n".join(gecmis) if gecmis else ""
+            baglam = await sohbet_baglami(message)
             ilgili = gecmis_ara(message.guild.id, soru)
             if ilgili:
                 baglam += "\n\nSunucuda geçmişte yazılmış ilgili mesajlar:\n" + "\n".join(ilgili)
@@ -1262,6 +1397,21 @@ async def unut(interaction: discord.Interaction, numara: int):
     veri[str(interaction.guild.id)] = liste
     json_kaydet(OGRENILEN_DOSYASI, veri)
     await interaction.response.send_message(f"Unuttum: {silinen[:150]}", ephemeral=True)
+    await ogrenme_logla(interaction.guild, f"🗑️ **#{numara}** unutuldu ({interaction.user.display_name}): {silinen[:500]}\n"
+                        f"(Sonraki numaralar bir azaldı, güncel liste için `/ogrendiklerim`)")
+
+
+@bot.tree.command(name="öğrenmebelirle", description="Botun öğrendiği bilgilerin numaralı log atılacağı kanalı seçer (yönetici)")
+@app_commands.describe(kanal="Log kanalı")
+@app_commands.default_permissions(administrator=True)
+@app_commands.guild_only()
+async def ogrenmebelirle(interaction: discord.Interaction, kanal: discord.TextChannel):
+    if not kanal.permissions_for(interaction.guild.me).send_messages:
+        return await interaction.response.send_message(f"Botun {kanal.mention} kanalına yazma izni yok.", ephemeral=True)
+    ayarlar = json_yukle(AYAR_DOSYASI)
+    ayarlar.setdefault(str(interaction.guild.id), {})["ogrenme_log_kanal"] = kanal.id
+    json_kaydet(AYAR_DOSYASI, ayarlar)
+    await interaction.response.send_message(f"Öğrenilen bilgiler artık {kanal.mention} kanalına numarasıyla loglanacak.", ephemeral=True)
 
 
 @bot.tree.command(name="yap", description="Yapay zekaya sunucuda iş yaptır (sadece sunucu sahibi)")
