@@ -192,7 +192,7 @@ async def sohbet_baglami(message: discord.Message) -> str:
     return "Son konuşmalar:\n" + "\n".join(satirlar) if satirlar else ""
 
 
-YONETIM_KELIMELERI = ("kanal", "kategori", "rol", "izin", "yetki", "görs", "göreb", "görün", "ayarla",
+YONETIM_KELIMELERI = ("duyuru", "kanal", "kategori", "rol", "izin", "yetki", "görs", "göreb", "görün", "ayarla",
                       "oluştur", "ekle", "adını", "ismini", "sesli", "yazılı", "yazamas", "yazabil")
 
 
@@ -229,6 +229,10 @@ YAP_SISTEM = (
     "add_reactions, attach_files, embed_links, mention_everyone, create_public_threads, send_messages_in_threads, use_external_emojis. "
     "'Mesaj silme yetkisi' = manage_messages. 'Yönetici hariç kimse X yapamasın' = kapsam hepsi + engelle (yöneticiler zaten etkilenmez))\n"
     '- {"islem":"kanal_adi","kanal":<id | ref>,"yeni_ad":"..."}\n'
+    '- {"islem":"duyuru_yaz","kanal":<duyurunun gönderileceği kanal id>,"ornek_kanal":<biçimi örnek alınacak, önceki duyuruların olduğu kanal id | null>,'
+    '"icerik":"duyurunun konusu ve ayrıntıları (saat, tarih, konu vb.) kullanıcının yazdığı gibi"}  '
+    "(bot, örnek kanaldaki önceki duyurulara benzer yeni bir duyuru yazıp gönderir; gönderilmeden önce taslak gösterilir. "
+    "Zamanlama ('saat 7'de at') DESTEKLENMEZ, onay verilince hemen gönderilir; böyle bir istek varsa not'a yaz)\n"
     '- {"islem":"rol_olustur","ad":"...","renk":"#RRGGBB"}  (renk opsiyonel)\n'
     '- {"islem":"rol_ver","kisi":<kullanıcı id>,"rol":<rol id>}\n'
     '- {"islem":"rol_al","kisi":<kullanıcı id>,"rol":<rol id>}\n'
@@ -254,6 +258,35 @@ IZIN_ADLARI = {
 }
 
 
+def _ping_temizle(metin: str) -> str:
+    """@everyone / @here yazılarını etkisiz hale getirir (taslakla yanlışlıkla herkes etiketlenmesin)."""
+    return metin.replace("@everyone", "@\u200beveryone").replace("@here", "@\u200bhere")
+
+
+async def duyuru_taslak_yaz(guild: discord.Guild, i: dict):
+    """Örnek kanaldaki önceki duyurulara bakıp aynı biçimde yeni duyuru taslağı yazar. Olmazsa None."""
+    ornek = _id_ad(guild, "kanal", i.get("ornek_kanal"))
+    ornekler = []
+    if isinstance(ornek, discord.TextChannel):
+        try:
+            async for m in ornek.history(limit=8):
+                t = m.content or " ".join((e.description or "") for e in m.embeds)
+                if t.strip():
+                    ornekler.append(t.strip()[:700])
+        except discord.HTTPException:
+            return None
+    sistem = ("Sen bir Discord duyuru yazarısın. Verilen örnek duyuruların biçimini (başlık, emoji, madde yapısı, hitap, "
+              "uzunluk, imza) birebir taklit ederek yeni bir duyuru yaz. Bilgileri (konu, saat, tarih) SADECE kullanıcının "
+              "verdiği bilgilerden al, uydurma ve eksik bilgi varsa bırak. Hiçbir kişiyi/rolü etiketleme. "
+              "Sadece duyuru metnini döndür, açıklama ekleme.")
+    kullanici = ""
+    if ornekler:
+        kullanici += "Örnek duyurular:\n---\n" + "\n---\n".join(ornekler) + "\n---\n\n"
+    kullanici += f"Yeni duyuru için bilgiler: {i.get('icerik') or ''}"
+    metin = await ai_calistir(sistem, kullanici, token=700)
+    return _ping_temizle(metin.strip())[:1900] if metin else None
+
+
 async def yap_hazirla(guild: discord.Guild, istek: str, kanal=None, baglam: str = ""):
     """İsteği işlem listesine çevirir. (islemler, not) döner; yapay zeka cevap vermezse (None, hata)."""
     roller = "; ".join(f"{r.name}={r.id}" for r in guild.roles[:100])
@@ -268,6 +301,14 @@ async def yap_hazirla(guild: discord.Guild, istek: str, kanal=None, baglam: str 
         veri = json.loads(metin)
         islemler = [i for i in veri.get("islemler", []) if isinstance(i, dict)][:12]
         not_ = str(veri.get("not", "") or "")
+        for i in list(islemler):
+            if i.get("islem") == "duyuru_yaz":
+                taslak = await duyuru_taslak_yaz(guild, i)
+                if taslak:
+                    i["taslak"] = taslak
+                else:
+                    islemler.remove(i)
+                    not_ += " Duyuru taslağını yazamadım (kanal bulunamadı, geçmişi okuma izni yok ya da yapay zeka cevap vermedi)."
         if not islemler and not veri.get("yonetim_istegi"):
             not_ = ""  # sohbet mesajı: yönetim notu verme, normal sohbete düşsün
         elif not islemler and not not_:
@@ -357,6 +398,10 @@ def yap_tanim(guild: discord.Guild, i: dict, ref_adlari: dict = None) -> str:
         if i.get("izin") in eski:
             parca.append(eski[i["izin"]])
         return f"**#{kanal_adi(i.get('kanal'))}** kanalında {kim} → " + ("; ".join(parca) or "?")
+    if t == "duyuru_yaz":
+        ornek = f" (biçim örneği: #{kanal_adi(i.get('ornek_kanal'))})" if i.get("ornek_kanal") else ""
+        return (f"**#{kanal_adi(i.get('kanal'))}** kanalına şu duyuruyu gönder{ornek}, kimseyi etiketlemez:\n"
+                f"```\n{(i.get('taslak') or '?')[:600]}\n```")
     if t == "rol_olustur":
         return f"**{i.get('ad')}** adında rol oluştur"
     if t in ("rol_ver", "rol_al"):
@@ -456,6 +501,11 @@ async def yap_uygula(guild: discord.Guild, i: dict, yapan: str, refs: dict, ref_
             if not kanal:
                 return f"❌ {tanim} (kanal bulunamadı)"
             await kanal.edit(name=str(i.get("yeni_ad"))[:100], reason=sebep)
+        elif t == "duyuru_yaz":
+            if not isinstance(kanal, discord.TextChannel) or not i.get("taslak"):
+                return f"❌ Duyuru gönderilemedi (kanal bulunamadı)"
+            await kanal.send(i["taslak"], allowed_mentions=discord.AllowedMentions.none())
+            return f"✅ Duyuru {kanal.mention} kanalına gönderildi"
         else:
             return f"❌ {tanim}"
     except discord.Forbidden:
@@ -1568,7 +1618,7 @@ def nick_roblox_adi(uye: discord.Member) -> str:
 
 
 def rutbe_yetkilisi_mi(interaction: discord.Interaction) -> bool:
-    return yap_yetkilisi_mi(interaction.user.id, interaction.guild) or interaction.user.guild_permissions.administrator
+    return interaction.user.guild_permissions.administrator  # Sadece Yönetici izni olanlar (sunucu sahibi de dahil)
 
 
 @bot.tree.command(name="robloxrutbeler", description="Roblox grubundaki rütbeleri listeler (yönetici)")
