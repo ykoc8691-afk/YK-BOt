@@ -54,12 +54,25 @@ def ogrenilen_ekle(guild_id: int, bilgi: str) -> int:
     return len(veri[str(guild_id)])
 
 
+AI_SERT_PROMPTU = (
+    "Sen bir Discord kampı sunucusunun botusun. Sert, agresif, sivri dilli ve sabırsız bir üslubun var; "
+    "yaltaklanmaz, uzun uzun özür dilemezsin, laf sokarsın. Ama KÜFÜR ETMEZSİN, hakaret/ırkçılık/cinsiyetçilik "
+    "yapmazsın, kimseyi gerçekten tehdit etmezsin ve yasa dışı hiçbir şeye yardım etmezsin — bunlar tartışmaya "
+    "kapalı sınırlar. Cevapların kısa ve Türkçe olsun, gereksiz uzatma."
+)
+
+
+def ai_mod_getir(guild_id: int) -> str:
+    return json_yukle(AYAR_DOSYASI).get(str(guild_id), {}).get("ai_mod", "normal")
+
+
 def ai_sistem_prompt(guild_id: int) -> str:
+    temel = AI_SERT_PROMPTU if ai_mod_getir(guild_id) == "sert" else AI_SISTEM_PROMPTU
     bilgiler = ogrenilenleri_getir(guild_id)[-40:]
     if not bilgiler:
-        return AI_SISTEM_PROMPTU
+        return temel
     metin = "\n".join(f"- {b}" for b in bilgiler)[:4000]
-    return (AI_SISTEM_PROMPTU + "\n\nSana öğretilen bilgiler (doğru kabul et, ilgili soru gelirse bunları kullan):\n" + metin)
+    return (temel + "\n\nSana öğretilen bilgiler (doğru kabul et, ilgili soru gelirse bunları kullan):\n" + metin)
 
 
 def gecmis_ara(guild_id: int, soru: str, limit: int = 6) -> list:
@@ -1151,6 +1164,28 @@ async def yap(interaction: discord.Interaction, istek: str):
     else:
         await interaction.followup.send(metin, ephemeral=True)
 
+
+
+# 4c) /sertmesaj, /normalmesaj -> yapay zekanın üslubunu değiştirir (sadece sunucu sahibi)
+async def ai_mod_ayarla(interaction: discord.Interaction, mod: str, cevap: str):
+    if not yap_yetkilisi_mi(interaction.user.id, interaction.guild):
+        return await interaction.response.send_message("Bu komutu sadece sunucu sahibi kullanabilir.", ephemeral=True)
+    ayarlar = json_yukle(AYAR_DOSYASI)
+    ayarlar.setdefault(str(interaction.guild.id), {})["ai_mod"] = mod
+    json_kaydet(AYAR_DOSYASI, ayarlar)
+    await interaction.response.send_message(cevap, ephemeral=True)
+
+
+@bot.tree.command(name="sertmesaj", description="Yapay zekayı sert/agresif moda geçirir (sadece sunucu sahibi)")
+@app_commands.guild_only()
+async def sertmesaj(interaction: discord.Interaction):
+    await ai_mod_ayarla(interaction, "sert", "Yapay zeka artık **sert** modda.")
+
+
+@bot.tree.command(name="normalmesaj", description="Yapay zekayı normal (esprili) moda geçirir (sadece sunucu sahibi)")
+@app_commands.guild_only()
+async def normalmesaj(interaction: discord.Interaction):
+    await ai_mod_ayarla(interaction, "normal", "Yapay zeka artık **normal** modda.")
 
 
 # 4) /duyuru -> sadece yöneticiler, bulunduğu kanala embed duyuru atar
